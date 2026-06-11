@@ -42,6 +42,7 @@ export interface CharacterData {
   affinityMax: number;
   isPlayer: boolean;
   skills: string[];
+  skillCooldowns: Record<string, number>;
 }
 
 export interface ItemConfig {
@@ -54,15 +55,21 @@ export interface ItemConfig {
   maxStack?: number;
   usable?: boolean;
   effects?: ItemEffect[];
+  price?: number;
 }
 
 export interface ItemEffect {
-  type: 'heal' | 'damage' | 'buff' | 'debuff' | 'custom';
+  type: 'heal' | 'damage' | 'buff' | 'debuff' | 'mpRestore' | 'custom';
   target?: 'self' | 'enemy' | 'ally';
   attributeId?: string;
   value: number;
   duration?: number;
   customType?: string;
+  id?: string;
+  name?: string;
+  dotDamage?: number;
+  tickDamage?: number;
+  attributes?: Record<string, number>;
 }
 
 export interface InventoryItem {
@@ -79,6 +86,14 @@ export interface QuestObjective {
   description: string;
 }
 
+export interface QuestPhase {
+  id: string;
+  name?: string;
+  description?: string;
+  objectives: Omit<QuestObjective, 'currentCount'>[];
+  rewards?: QuestReward[];
+}
+
 export interface QuestReward {
   type: 'exp' | 'item' | 'gold' | 'attribute' | 'affinity';
   itemId?: string;
@@ -87,6 +102,8 @@ export interface QuestReward {
   value: number;
   quantity?: number;
 }
+
+export type QuestRepeatType = 'none' | 'daily' | 'weekly' | 'custom';
 
 export interface QuestConfig {
   id: string;
@@ -97,6 +114,12 @@ export interface QuestConfig {
   prerequisites?: string[];
   isMain?: boolean;
   chapterId?: string;
+  repeatType?: QuestRepeatType;
+  repeatInterval?: number;
+  repeatCount?: number;
+  phases?: QuestPhase[];
+  autoStart?: boolean;
+  autoComplete?: boolean;
 }
 
 export interface QuestData {
@@ -104,6 +127,11 @@ export interface QuestData {
   status: 'available' | 'active' | 'completed' | 'failed';
   objectives: QuestObjective[];
   completedAt?: number;
+  currentPhaseIndex?: number;
+  phaseObjectives?: QuestObjective[];
+  repeatCount?: number;
+  lastResetAt?: number;
+  claimedRewards?: boolean;
 }
 
 export interface DialogueChoice {
@@ -115,16 +143,33 @@ export interface DialogueChoice {
 }
 
 export interface DialogueEffect {
-  type: 'attribute' | 'affinity' | 'item' | 'quest' | 'variable' | 'chapter';
+  type: 'attribute' | 'affinity' | 'item' | 'quest' | 'variable' | 'chapter' | 'gold' | 'exp' | 'skill';
   attributeId?: string;
   characterId?: string;
   itemId?: string;
   questId?: string;
   variableKey?: string;
   chapterId?: string;
+  skillId?: string;
   value?: number | string | boolean;
   operation?: 'add' | 'set' | 'remove';
-  questAction?: 'start' | 'complete' | 'update';
+  questAction?: 'start' | 'complete' | 'update' | 'reset';
+}
+
+export interface EffectResult {
+  effect: DialogueEffect;
+  success: boolean;
+  oldValue?: any;
+  newValue?: any;
+  message?: string;
+  error?: string;
+}
+
+export interface EffectsExecutionResult {
+  results: EffectResult[];
+  totalSuccess: number;
+  totalFailed: number;
+  allSuccess: boolean;
 }
 
 export interface DialogueCondition {
@@ -148,6 +193,8 @@ export interface DialogueConfig {
   choices?: DialogueChoice[];
   nextDialogueId?: string;
   effects?: DialogueEffect[];
+  onStartEffects?: DialogueEffect[];
+  onEndEffects?: DialogueEffect[];
   isEnd?: boolean;
   chapterId?: string;
 }
@@ -155,6 +202,7 @@ export interface DialogueConfig {
 export interface DialogueState {
   currentDialogueId: string | null;
   history: string[];
+  choicesMade: Record<string, string>;
 }
 
 export interface BattleAction {
@@ -162,6 +210,20 @@ export interface BattleAction {
   skillId?: string;
   itemId?: string;
   targetId?: string;
+}
+
+export interface SkillConfig {
+  id: string;
+  name: string;
+  description?: string;
+  icon?: string;
+  mpCost?: number;
+  cooldown?: number;
+  targetType: 'single' | 'single_enemy' | 'single_ally' | 'all_enemies' | 'all_allies' | 'self';
+  damageMultiplier?: number;
+  healAmount?: number;
+  effects?: ItemEffect[];
+  requiredLevel?: number;
 }
 
 export interface BattleCharacter {
@@ -172,7 +234,10 @@ export interface BattleCharacter {
   currentMp?: number;
   maxMp?: number;
   buffs: Buff[];
+  debuffs: Buff[];
   isDefending: boolean;
+  skillCooldowns: Record<string, number>;
+  tookDamageThisTurn?: boolean;
 }
 
 export interface Buff {
@@ -183,6 +248,8 @@ export interface Buff {
   value: number;
   duration: number;
   remainingTurns: number;
+  tickDamage?: number;
+  onTickMessage?: string;
 }
 
 export interface BattleConfig {
@@ -193,9 +260,15 @@ export interface BattleConfig {
   maxTurns?: number;
   allowFlee?: boolean;
   retryable?: boolean;
+  turnOrder?: 'speed' | 'player_first' | 'alternating';
   onVictory?: DialogueEffect[];
   onDefeat?: DialogueEffect[];
   onFlee?: DialogueEffect[];
+  onTurnStart?: DialogueEffect[];
+  onTurnEnd?: DialogueEffect[];
+  victoryRewards?: QuestReward[];
+  backgroundImage?: string;
+  music?: string;
 }
 
 export interface EnemyConfig {
@@ -204,7 +277,10 @@ export interface EnemyConfig {
   avatar?: string;
   attributes: Record<string, number>;
   expReward?: number;
+  goldReward?: number;
   skills?: string[];
+  loot?: { itemId: string; chance: number; minQuantity?: number; maxQuantity?: number }[];
+  behavior?: 'aggressive' | 'defensive' | 'random' | 'support';
 }
 
 export interface BattleState {
@@ -214,6 +290,13 @@ export interface BattleState {
   characters: BattleCharacter[];
   currentTurnCharacterId?: string;
   actionLog: BattleLogEntry[];
+  turnQueue: string[];
+  turnQueueIndex: number;
+  awardedRewards?: boolean;
+  originalState?: {
+    characters: { hp: number; mp?: number }[];
+    inventory: InventoryItem[];
+  };
 }
 
 export interface BattleLogEntry {
@@ -224,10 +307,16 @@ export interface BattleLogEntry {
   damage?: number;
   heal?: number;
   message: string;
+  timestamp: number;
+  critical?: boolean;
+  missed?: boolean;
+  skillId?: string;
+  itemId?: string;
 }
 
 export interface SaveData {
   id: string;
+  version: number;
   createdAt: number;
   updatedAt: number;
   chapterId: string;
@@ -239,16 +328,35 @@ export interface SaveData {
   variables: Record<string, any>;
   achievements: string[];
   playTime: number;
+  metadata?: Record<string, any>;
 }
 
 export interface SaveSlotInfo {
   id: string;
+  version?: number;
   chapterName?: string;
   playerName?: string;
   playerLevel?: number;
   updatedAt: number;
   playTime: number;
   thumbnail?: string;
+  metadata?: Record<string, any>;
+  size?: number;
+}
+
+export interface SaveStorageAdapter {
+  save(slotId: string, data: SaveData): Promise<boolean> | boolean;
+  load(slotId: string): Promise<SaveData | null> | SaveData | null;
+  delete(slotId: string): Promise<boolean> | boolean;
+  list?(): Promise<SaveSlotInfo[]> | SaveSlotInfo[];
+  exists?(slotId: string): Promise<boolean> | boolean;
+  clear?(): Promise<boolean> | boolean;
+}
+
+export interface SaveMigration {
+  fromVersion: number;
+  toVersion: number;
+  migrate: (data: any) => SaveData;
 }
 
 export interface AchievementConfig {
@@ -259,10 +367,12 @@ export interface AchievementConfig {
   condition: AchievementCondition;
   rewards?: QuestReward[];
   isHidden?: boolean;
+  points?: number;
+  rarity?: 'common' | 'rare' | 'epic' | 'legendary';
 }
 
 export interface AchievementCondition {
-  type: 'quest' | 'attribute' | 'item' | 'level' | 'chapter' | 'battle' | 'custom';
+  type: 'quest' | 'attribute' | 'item' | 'level' | 'chapter' | 'battle' | 'custom' | 'playtime' | 'kill' | 'collection';
   questId?: string;
   attributeId?: string;
   itemId?: string;
@@ -282,6 +392,10 @@ export interface ChapterConfig {
   order: number;
   prerequisites?: string[];
   endingId?: string;
+  onEnterEffects?: DialogueEffect[];
+  onCompleteEffects?: DialogueEffect[];
+  backgroundImage?: string;
+  thumbnail?: string;
 }
 
 export interface EndingConfig {
@@ -290,6 +404,8 @@ export interface EndingConfig {
   description?: string;
   condition: DialogueCondition[];
   isGood?: boolean;
+  effects?: DialogueEffect[];
+  thumbnail?: string;
 }
 
 export type RPGEventType =
@@ -300,24 +416,42 @@ export type RPGEventType =
   | 'itemUsed'
   | 'questStarted'
   | 'questUpdated'
+  | 'questObjectiveComplete'
+  | 'questPhaseComplete'
   | 'questCompleted'
+  | 'questRewardsClaimed'
   | 'questFailed'
+  | 'questReset'
   | 'questAvailable'
   | 'dialogueStart'
   | 'dialogueEnd'
   | 'choiceSelected'
+  | 'effectsExecuted'
   | 'effectTriggered'
   | 'battleStart'
   | 'battleEnd'
   | 'battleTurn'
   | 'battleEnemyAction'
+  | 'battleSkillUsed'
+  | 'battleVictory'
+  | 'battleDefeat'
+  | 'battleFled'
+  | 'battleRetry'
   | 'achievementUnlocked'
   | 'chapterUnlocked'
+  | 'chapterEntered'
   | 'endingTriggered'
   | 'saveCreated'
   | 'saveLoaded'
+  | 'saveDeleted'
+  | 'saveImported'
+  | 'saveExported'
+  | 'saveMigrated'
   | 'affinityChange'
-  | 'variableChange';
+  | 'variableChange'
+  | 'skillLearned'
+  | 'skillUsed'
+  | 'goldChange';
 
 export interface RPGEvent {
   type: RPGEventType;
@@ -328,11 +462,13 @@ export interface RPGEvent {
 export type EventCallback = (event: RPGEvent) => void;
 
 export interface RPGCoreConfig {
+  version?: number;
   levelTable?: LevelConfig[];
   maxLevel?: number;
   expMultiplier?: number;
   defaultAttributes?: AttributeConfig[];
   items?: ItemConfig[];
+  skills?: SkillConfig[];
   characters?: CharacterConfig[];
   quests?: QuestConfig[];
   dialogues?: DialogueConfig[];
@@ -342,5 +478,10 @@ export interface RPGCoreConfig {
   battles?: BattleConfig[];
   initialGold?: number;
   saveStorageKey?: string;
+  saveAdapter?: SaveStorageAdapter;
+  saveMigrations?: SaveMigration[];
   autoSave?: boolean;
+  autoSaveInterval?: number;
+  validateValues?: boolean;
+  clampNegativeValues?: boolean;
 }

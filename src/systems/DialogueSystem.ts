@@ -4,8 +4,10 @@ import {
   DialogueChoice,
   DialogueEffect,
   DialogueCondition,
+  EffectsExecutionResult,
 } from '../types';
 import { EventEmitter } from './EventEmitter';
+import { EffectExecutor } from './EffectExecutor';
 
 export interface DialogueContext {
   getAttribute: (characterId: string, attributeId: string) => number;
@@ -22,9 +24,11 @@ export class DialogueSystem extends EventEmitter {
   private state: DialogueState = {
     currentDialogueId: null,
     history: [],
+    choicesMade: {},
   };
   private variables: Record<string, any> = {};
   private context?: DialogueContext;
+  private effectExecutor?: EffectExecutor;
 
   constructor(configs: DialogueConfig[] = []) {
     super();
@@ -33,6 +37,31 @@ export class DialogueSystem extends EventEmitter {
 
   setContext(context: DialogueContext): void {
     this.context = context;
+  }
+
+  setEffectExecutor(executor: EffectExecutor): void {
+    this.effectExecutor = executor;
+  }
+
+  runEffects(effects: DialogueEffect[]): EffectsExecutionResult {
+    if (this.effectExecutor) {
+      return this.effectExecutor.execute(effects, 'dialogue');
+    }
+    const results = effects.map((effect) => {
+      this.emit('effectTriggered', { effect });
+      return {
+        effect,
+        success: true,
+      };
+    });
+    const totalSuccess = results.filter((r) => r.success).length;
+    const totalFailed = results.length - totalSuccess;
+    return {
+      results,
+      totalSuccess,
+      totalFailed,
+      allSuccess: totalFailed === 0,
+    };
   }
 
   addDialogueConfig(config: DialogueConfig): void {
@@ -48,7 +77,10 @@ export class DialogueSystem extends EventEmitter {
   }
 
   getState(): DialogueState {
-    return { ...this.state };
+    return {
+      ...this.state,
+      choicesMade: { ...this.state.choicesMade },
+    };
   }
 
   getCurrentDialogue(): DialogueConfig | null {
@@ -63,8 +95,12 @@ export class DialogueSystem extends EventEmitter {
     this.state.currentDialogueId = dialogueId;
     this.state.history.push(dialogueId);
 
+    if (config.onStartEffects?.length) {
+      this.runEffects(config.onStartEffects);
+    }
+
     if (config.effects?.length) {
-      this.applyEffects(config.effects);
+      this.runEffects(config.effects);
     }
 
     this.emit('dialogueStart', {
@@ -96,6 +132,10 @@ export class DialogueSystem extends EventEmitter {
       return null;
     }
 
+    if (this.state.currentDialogueId) {
+      this.state.choicesMade[this.state.currentDialogueId] = choiceId;
+    }
+
     this.emit('choiceSelected', {
       dialogueId: this.state.currentDialogueId,
       choiceId,
@@ -103,24 +143,45 @@ export class DialogueSystem extends EventEmitter {
     });
 
     if (choice.effects?.length) {
-      this.applyEffects(choice.effects);
+      const result = this.runEffects(choice.effects);
+      this.emit('effectsExecuted', {
+        ...result,
+        source: 'choice',
+        dialogueId: this.state.currentDialogueId,
+        choiceId,
+        effects: choice.effects,
+      });
     }
 
     if (choice.nextDialogueId) {
-      return this.goToDialogue(choice.nextDialogueId);
+      return this.goToDialogue(choice.nextDialogueId).dialogue;
     }
 
     this.endDialogue();
     return null;
   }
 
-  next(): DialogueConfig | null {
+  next(): EffectsExecutionResult & { dialogue: DialogueConfig | null } {
     const current = this.getCurrentDialogue();
-    if (!current) return null;
+    if (!current) {
+      return {
+        results: [],
+        totalSuccess: 0,
+        totalFailed: 0,
+        allSuccess: true,
+        dialogue: null,
+      };
+    }
 
     if (current.isEnd) {
       this.endDialogue();
-      return null;
+      return {
+        results: [],
+        totalSuccess: 0,
+        totalFailed: 0,
+        allSuccess: true,
+        dialogue: null,
+      };
     }
 
     if (current.nextDialogueId) {
@@ -129,36 +190,75 @@ export class DialogueSystem extends EventEmitter {
 
     if (!current.choices?.length) {
       this.endDialogue();
-      return null;
+      return {
+        results: [],
+        totalSuccess: 0,
+        totalFailed: 0,
+        allSuccess: true,
+        dialogue: null,
+      };
     }
 
-    return current;
+    return {
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      allSuccess: true,
+      dialogue: current,
+    };
   }
 
-  private goToDialogue(dialogueId: string): DialogueConfig | null {
+  private goToDialogue(dialogueId: string): EffectsExecutionResult & { dialogue: DialogueConfig | null } {
     const config = this.dialogueConfigs.get(dialogueId);
     if (!config) {
       this.endDialogue();
-      return null;
+      return {
+        results: [],
+        totalSuccess: 0,
+        totalFailed: 0,
+        allSuccess: true,
+        dialogue: null,
+      };
     }
 
     this.state.currentDialogueId = dialogueId;
     this.state.history.push(dialogueId);
 
-    if (config.effects?.length) {
-      this.applyEffects(config.effects);
+    let effectsResult: EffectsExecutionResult = {
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      allSuccess: true,
+    };
+
+    if (config.onStartEffects?.length) {
+      this.runEffects(config.onStartEffects);
     }
 
-    return config;
+    if (config.effects?.length) {
+      effectsResult = this.runEffects(config.effects);
+    }
+
+    return {
+      ...effectsResult,
+      dialogue: config,
+    };
   }
 
   endDialogue(): void {
     const dialogueId = this.state.currentDialogueId;
+    const config = dialogueId ? this.dialogueConfigs.get(dialogueId) : undefined;
+    const history = [...this.state.history];
+
+    if (config?.onEndEffects?.length) {
+      this.runEffects(config.onEndEffects);
+    }
+
     this.state.currentDialogueId = null;
 
     this.emit('dialogueEnd', {
       dialogueId,
-      history: [...this.state.history],
+      history,
     });
   }
 
@@ -239,12 +339,6 @@ export class DialogueSystem extends EventEmitter {
     }
   }
 
-  private applyEffects(effects: DialogueEffect[]): void {
-    effects.forEach((effect) => {
-      this.emit('effectTriggered', { effect });
-    });
-  }
-
   getVariable(key: string): any {
     return this.variables[key];
   }
@@ -266,6 +360,26 @@ export class DialogueSystem extends EventEmitter {
     return { ...this.variables };
   }
 
+  setAllVariables(variables: Record<string, any>): void {
+    this.variables = { ...variables };
+  }
+
+  getDialogueState(): DialogueState {
+    return {
+      ...this.state,
+      choicesMade: { ...this.state.choicesMade },
+      history: [...this.state.history],
+    };
+  }
+
+  setDialogueState(state: DialogueState): void {
+    this.state = {
+      ...state,
+      choicesMade: { ...state.choicesMade },
+      history: [...state.history],
+    };
+  }
+
   hasDialogue(dialogueId: string): boolean {
     return this.dialogueConfigs.has(dialogueId);
   }
@@ -278,18 +392,25 @@ export class DialogueSystem extends EventEmitter {
     this.state = {
       currentDialogueId: null,
       history: [],
+      choicesMade: {},
     };
   }
 
   toJSON(): { state: DialogueState; variables: Record<string, any> } {
     return {
-      state: { ...this.state },
+      state: {
+        ...this.state,
+        choicesMade: { ...this.state.choicesMade },
+      },
       variables: { ...this.variables },
     };
   }
 
   fromJSON(data: { state: DialogueState; variables: Record<string, any> }): void {
-    this.state = { ...data.state };
+    this.state = {
+      ...data.state,
+      choicesMade: { ...data.state.choicesMade },
+    };
     this.variables = { ...data.variables };
   }
 }

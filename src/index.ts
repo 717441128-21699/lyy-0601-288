@@ -8,5 +8,6 @@ export { DialogueSystem } from './systems/DialogueSystem';
 export { BattleSystem } from './systems/BattleSystem';
 export { SaveSystem } from './systems/SaveSystem';
 export { AchievementSystem } from './systems/AchievementSystem';
+export { EffectExecutor } from './systems/EffectExecutor';
 
 export * from './types';

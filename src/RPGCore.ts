@@ -23,17 +23,35 @@ import {
   InventoryItem,
   AttributeConfig,
   LevelConfig,
+  SkillConfig,
+  EffectsExecutionResult,
+  SaveStorageAdapter,
+  SaveMigration,
 } from './types';
 
 import { EventEmitter } from './systems/EventEmitter';
 import { AttributeSystem } from './systems/AttributeSystem';
 import { CharacterSystem } from './systems/CharacterSystem';
 import { InventorySystem } from './systems/InventorySystem';
-import { QuestSystem } from './systems/QuestSystem';
+import { QuestSystem, QuestRewardHandler } from './systems/QuestSystem';
 import { DialogueSystem } from './systems/DialogueSystem';
 import { BattleSystem } from './systems/BattleSystem';
 import { SaveSystem } from './systems/SaveSystem';
 import { AchievementSystem } from './systems/AchievementSystem';
+import { EffectExecutor, EffectContext } from './systems/EffectExecutor';
+
+export {
+  AttributeSystem,
+  CharacterSystem,
+  InventorySystem,
+  QuestSystem,
+  DialogueSystem,
+  BattleSystem,
+  SaveSystem,
+  AchievementSystem,
+  EffectExecutor,
+  EventEmitter,
+};
 
 export class RPGCore extends EventEmitter {
   public attribute: AttributeSystem;
@@ -44,44 +62,125 @@ export class RPGCore extends EventEmitter {
   public battle: BattleSystem;
   public save: SaveSystem;
   public achievement: AchievementSystem;
+  public effect: EffectExecutor;
 
   private config: RPGCoreConfig;
   private battleResults: Map<string, string> = new Map();
+  private autoSaveTimer: any;
+  private _isReady: boolean = false;
+  private version: number;
 
   constructor(config: RPGCoreConfig = {}) {
     super();
     this.config = config;
+    this.version = config.version ?? 1;
+
+    const validateValues = config.validateValues ?? true;
+    const clampNegativeValues = config.clampNegativeValues ?? true;
 
     this.attribute = new AttributeSystem(config.defaultAttributes || []);
 
     this.character = new CharacterSystem(
       config.characters || [],
       config.levelTable || [],
-      config.maxLevel
+      config.maxLevel,
+      config.defaultAttributes || []
     );
 
     this.inventory = new InventorySystem(
       config.items || [],
-      config.initialGold || 0
+      config.initialGold || 0,
+      { validateValues, clampNegativeValues }
     );
 
     this.quest = new QuestSystem(config.quests || []);
 
     this.dialogue = new DialogueSystem(config.dialogues || []);
 
-    this.battle = new BattleSystem(config.battles || []);
-
-    this.save = new SaveSystem(
-      config.chapters || [],
-      config.endings || [],
-      config.saveStorageKey,
-      config.autoSave
+    this.battle = new BattleSystem(
+      config.battles || [],
+      config.skills || []
     );
+
+    this.save = new SaveSystem({
+      chapters: config.chapters || [],
+      endings: config.endings || [],
+      storageKey: config.saveStorageKey,
+      autoSave: config.autoSave,
+      autoSaveInterval: config.autoSaveInterval,
+      adapter: config.saveAdapter,
+      migrations: config.saveMigrations,
+      currentVersion: this.version,
+      validateValues,
+      clampNegativeValues,
+      autoRestore: true,
+    });
 
     this.achievement = new AchievementSystem(config.achievements || []);
 
+    this.effect = new EffectExecutor(this.buildEffectContext());
+
     this.setupContexts();
+    this.setupRewardHandler();
     this.setupEventBridging();
+
+    Promise.resolve().then(async () => {
+      try {
+        await (this.save as any).tryRestoreLastSave?.();
+      } catch (e) {}
+      await this.checkAutoStartQuests();
+      this._isReady = true;
+    });
+
+    if (config.autoSave && config.autoSaveInterval) {
+      this.autoSaveTimer = setInterval(() => {
+        this.quickSave();
+      }, config.autoSaveInterval);
+    }
+  }
+
+  get isReady(): boolean {
+    return this._isReady;
+  }
+
+  get currentVersion(): number {
+    return this.version;
+  }
+
+  private buildEffectContext(): EffectContext {
+    const self = this;
+    return {
+      getAttribute: (cid, aid) => self.character.getAttribute(cid, aid),
+      setAttribute: (cid, aid, v) => self.character.setAttribute(cid, aid, v),
+      addAttribute: (cid, aid, n) => self.character.addAttribute(cid, aid, n),
+      getAffinity: (cid) => self.character.getAffinity(cid),
+      addAffinity: (cid, n) => self.character.addAffinity(cid, n),
+      setAffinity: (cid, v) => self.character.setAffinity(cid, v),
+      hasItem: (iid, q) => self.inventory.hasItem(iid, q),
+      addItem: (iid, q) => self.inventory.addItem(iid, q),
+      removeItem: (iid, q) => self.inventory.removeItem(iid, q),
+      startQuest: (qid) => self.quest.startQuest(qid),
+      completeQuest: (qid) => self.quest.completeQuest(qid),
+      updateQuestObjective: (qid, oid, n) => self.quest.updateObjective(qid, oid, n),
+      resetQuest: (qid) => self.quest.resetQuest(qid),
+      getVariable: (k) => self.dialogue.getVariable(k),
+      setVariable: (k, v) => self.dialogue.setVariable(k, v),
+      unlockChapter: (cid) => self.save.unlockChapter(cid),
+      setCurrentChapter: (cid) => self.save.setCurrentChapter(cid),
+      addGold: (n) => self.inventory.addGold(n),
+      spendGold: (n) => self.inventory.spendGold(n),
+      addExp: (cid, n) => self.character.addExp(cid, n),
+      addSkill: (cid, sid) => self.character.addSkill(cid, sid),
+      getPlayerCharacterId: () => self.character.getPlayerCharacter()?.id,
+      clampValue: (v, min?, max?) => {
+        if (typeof v !== 'number' || isNaN(v) || !isFinite(v)) return min ?? 0;
+        let r = v;
+        if (min !== undefined) r = Math.max(min, r);
+        if (max !== undefined) r = Math.min(max, r);
+        return r;
+      },
+      isValidNumber: (v) => typeof v === 'number' && !isNaN(v) && isFinite(v),
+    };
   }
 
   private setupContexts(): void {
@@ -94,49 +193,30 @@ export class RPGCore extends EventEmitter {
       getLevel: (charId) => this.character.getLevel(charId),
       getChapterId: () => this.save.getCurrentChapterId(),
     });
+    this.dialogue.setEffectExecutor(this.effect);
 
     this.battle.setContext({
-      getCharacterAttribute: (charId, attrId) =>
-        this.character.getAttribute(charId, attrId),
+      getCharacterAttribute: (charId, attrId) => this.character.getAttribute(charId, attrId),
       getCharacterMaxHp: (charId) =>
-        this.character.getAttribute(charId, 'maxHp') ||
-        this.character.getAttribute(charId, 'hp') ||
-        100,
+        this.character.getAttribute(charId, 'maxHp') || this.character.getAttribute(charId, 'hp') || 100,
       getCharacterMaxMp: (charId) =>
-        this.character.getAttribute(charId, 'maxMp') ||
-        this.character.getAttribute(charId, 'mp') ||
-        50,
+        this.character.getAttribute(charId, 'maxMp') || this.character.getAttribute(charId, 'mp') || 50,
+      getCharacterSpeed: (charId) => this.character.getAttribute(charId, 'speed') || 10,
+      getCharacterSkills: (charId) => this.character.getCharacter(charId)?.skills || [],
+      getCharacterLevel: (charId) => this.character.getLevel(charId),
+      getSkillConfig: (skillId) => this.battle.getSkillConfig(skillId),
       addExp: (charId, exp) => this.character.addExp(charId, exp),
+      addGold: (amount) => this.inventory.addGold(amount),
+      addItem: (itemId, quantity) => this.inventory.addItem(itemId, quantity),
       hasItem: (itemId, quantity) => this.inventory.hasItem(itemId, quantity),
       useItem: (itemId, targetId) => this.inventory.useItem(itemId, targetId),
-    });
-
-    this.save.setContext({
-      getCharacters: () => this.character.toJSON(),
-      getInventory: () => this.inventory.toJSON(),
-      getQuests: () => this.quest.toJSON(),
-      getDialogueState: () => this.dialogue.toJSON().state,
-      getVariables: () => this.dialogue.getAllVariables(),
-      getAchievements: () => this.achievement.toJSON(),
-      getChapterId: () => this.save.getCurrentChapterId(),
-      getPlayTime: () => this.save.getPlayTime(),
-      loadCharacters: (data) => this.character.fromJSON(data as CharacterData[]),
-      loadInventory: (data) =>
-        this.inventory.fromJSON(data as { items: InventoryItem[]; gold: number }),
-      loadQuests: (data) => this.quest.fromJSON(data as QuestData[]),
-      loadDialogueState: (data) => {
-        const dialogueData = this.dialogue.toJSON();
-        dialogueData.state = data;
-        this.dialogue.fromJSON(dialogueData);
+      getInventorySnapshot: () => this.inventory.getAllItems(),
+      restoreInventory: (snapshot) => {
+        const items = this.inventory.getAllItems();
+        items.forEach((i) => this.inventory.removeItem(i.itemId, i.quantity));
+        snapshot.forEach((i) => this.inventory.addItem(i.itemId, i.quantity));
       },
-      loadVariables: (data) => {
-        const dialogueData = this.dialogue.toJSON();
-        dialogueData.variables = data;
-        this.dialogue.fromJSON(dialogueData);
-      },
-      loadAchievements: (data) => this.achievement.fromJSON(data),
-      loadChapterId: (chapterId) => this.save.setCurrentChapter(chapterId),
-      loadPlayTime: (playTime) => {},
+      executeDialogueEffects: (effects) => this.executeEffects(effects, 'battle'),
     });
 
     this.achievement.setContext({
@@ -150,54 +230,93 @@ export class RPGCore extends EventEmitter {
       getVariable: (key) => this.dialogue.getVariable(key),
       applyRewards: (rewards) => {
         const player = this.character.getPlayerCharacter();
-        if (player) {
-          this.applyQuestRewards(player.id, rewards);
-        }
+        if (player) this.applyQuestRewards(player.id, rewards);
       },
       getPlayerCharacterId: () => this.character.getPlayerCharacter()?.id,
     });
+
+    this.save.setContext({
+      getCharacters: () => this.character.toJSON(),
+      getInventory: () => ({
+        items: this.inventory.getAllItems(),
+        gold: this.inventory.getGold(),
+      }),
+      getQuests: () => this.quest.toJSON(),
+      getDialogueState: () => this.dialogue.getDialogueState(),
+      getVariables: () => this.dialogue.getAllVariables(),
+      getAchievements: () => this.achievement.toJSON(),
+      getChapterId: () => this.save.getCurrentChapterId(),
+      getPlayTime: () => (this.save as any).playTime ?? 0,
+      loadCharacters: (data) => this.character.fromJSON(data),
+      loadInventory: (data) => this.inventory.fromJSON(data),
+      loadQuests: (data) => this.quest.fromJSON(data),
+      loadDialogueState: (data) => this.dialogue.setDialogueState(data),
+      loadVariables: (data) => this.dialogue.setAllVariables(data),
+      loadAchievements: (data) => this.achievement.fromJSON(data),
+      loadChapterId: (chapterId) => {
+        if (chapterId) this.save.setCurrentChapter(chapterId);
+      },
+      loadPlayTime: (playTime) => {
+        if ((this.save as any).playTime !== undefined) {
+          (this.save as any).playTime = playTime;
+        }
+      },
+    });
+  }
+
+  private setupRewardHandler(): void {
+    const handler: QuestRewardHandler = {
+      claimRewards: (characterId, rewards) => {
+        const summary = this.applyQuestRewards(characterId, rewards);
+        return summary;
+      },
+      getPlayerCharacterId: () => this.character.getPlayerCharacter()?.id,
+    };
+    this.quest.setRewardHandler(handler);
+  }
+
+  private async checkAutoStartQuests(): Promise<void> {
+    const configs = this.quest.getAllQuestConfigs();
+    for (const cfg of configs) {
+      if (cfg.autoStart && this.quest.isQuestAvailable(cfg.id)) {
+        this.quest.startQuest(cfg.id);
+      }
+    }
   }
 
   private setupEventBridging(): void {
+    const systems: EventEmitter[] = [
+      this.attribute, this.character, this.inventory,
+      this.quest, this.dialogue, this.battle,
+      this.save, this.achievement, this.effect,
+    ];
+
+    const bridgeEvent = (event: any) => {
+      this.emit(event.type, event.payload);
+    };
+
+    systems.forEach((sys) => {
+      const originalOn = (sys as any).on?.bind?.(sys);
+      if (originalOn) {
+        (sys as any).on('*' as any, bridgeEvent);
+      }
+    });
+
     const bridgeEvents: RPGEventType[] = [
-      'levelUp',
-      'attributeChange',
-      'itemAdded',
-      'itemRemoved',
-      'itemUsed',
-      'questStarted',
-      'questUpdated',
-      'questCompleted',
-      'questFailed',
-      'dialogueStart',
-      'dialogueEnd',
-      'choiceSelected',
-      'battleStart',
-      'battleEnd',
-      'battleTurn',
-      'achievementUnlocked',
-      'chapterUnlocked',
-      'endingTriggered',
-      'saveCreated',
-      'saveLoaded',
-      'affinityChange',
-      'variableChange',
+      'levelUp', 'attributeChange', 'itemAdded', 'itemRemoved', 'itemUsed',
+      'questStarted', 'questUpdated', 'questObjectiveComplete', 'questPhaseComplete',
+      'questCompleted', 'questRewardsClaimed', 'questFailed', 'questReset', 'questAvailable',
+      'dialogueStart', 'dialogueEnd', 'choiceSelected', 'effectsExecuted', 'effectTriggered',
+      'battleStart', 'battleEnd', 'battleTurn', 'battleEnemyAction', 'battleSkillUsed',
+      'battleVictory', 'battleDefeat', 'battleFled', 'battleRetry',
+      'achievementUnlocked', 'chapterUnlocked', 'chapterEntered', 'endingTriggered',
+      'saveCreated', 'saveLoaded', 'saveDeleted', 'saveImported', 'saveExported', 'saveMigrated',
+      'affinityChange', 'variableChange', 'skillLearned', 'skillUsed', 'goldChange',
     ];
 
-    const systems = [
-      this.attribute,
-      this.character,
-      this.inventory,
-      this.quest,
-      this.dialogue,
-      this.battle,
-      this.save,
-      this.achievement,
-    ];
-
-    bridgeEvents.forEach((eventType) => {
-      systems.forEach((system) => {
-        system.on(eventType, (event) => {
+    bridgeEvents.forEach((type) => {
+      systems.forEach((sys) => {
+        sys.on(type, (event) => {
           this.emit(event.type, event.payload);
         });
       });
@@ -208,11 +327,20 @@ export class RPGCore extends EventEmitter {
       this.save.autoSaveIfEnabled();
     });
 
+    this.on('questRewardsClaimed', () => {
+      this.achievement.triggerCheck();
+    });
+
     this.on('levelUp', () => {
       this.achievement.triggerCheck();
     });
 
-    this.on('chapterUnlocked', () => {
+    this.on('chapterUnlocked', (ev: any) => {
+      const chapter = this.save.getCurrentChapter();
+      if (chapter?.onEnterEffects?.length) {
+        this.executeEffects(chapter.onEnterEffects, 'chapter_enter');
+      }
+      this.emit('chapterEntered', ev.payload);
       this.achievement.triggerCheck();
       this.save.autoSaveIfEnabled();
     });
@@ -229,244 +357,311 @@ export class RPGCore extends EventEmitter {
       this.save.autoSaveIfEnabled();
     });
 
-    this.on('effectTriggered', (event: any) => {
-      if (event.payload?.effect) {
-        this.applyDialogueEffect(event.payload.effect);
-      }
+    this.on('effectTriggered', () => {
+      this.achievement.triggerCheck();
     });
   }
 
-  private applyDialogueEffect(effect: DialogueEffect): void {
-    const {
-      type,
-      attributeId,
-      characterId,
-      itemId,
-      questId,
-      variableKey,
-      chapterId,
-      value,
-      operation = 'add',
-      questAction,
-    } = effect;
-
-    const targetCharId = characterId || this.character.getPlayerCharacter()?.id;
-    if (!targetCharId) return;
-
-    switch (type) {
-      case 'attribute':
-        if (attributeId && typeof value === 'number') {
-          if (operation === 'add') {
-            this.character.addAttribute(targetCharId, attributeId, value);
-          } else if (operation === 'set') {
-            this.character.setAttribute(targetCharId, attributeId, value);
-          } else if (operation === 'remove') {
-            this.character.addAttribute(targetCharId, attributeId, -value);
-          }
-        }
-        break;
-
-      case 'affinity':
-        if (typeof value === 'number') {
-          if (operation === 'add') {
-            this.character.addAffinity(targetCharId, value);
-          } else if (operation === 'set') {
-            this.character.setAffinity(targetCharId, value);
-          }
-        }
-        break;
-
-      case 'item':
-        if (itemId && typeof value === 'number') {
-          if (operation === 'add' || operation === 'set') {
-            this.inventory.addItem(itemId, value);
-          } else if (operation === 'remove') {
-            this.inventory.removeItem(itemId, value);
-          }
-        }
-        break;
-
-      case 'quest':
-        if (questId) {
-          if (questAction === 'start') {
-            this.quest.startQuest(questId);
-          } else if (questAction === 'complete') {
-            this.quest.completeQuest(questId);
-          }
-        }
-        break;
-
-      case 'variable':
-        if (variableKey && value !== undefined) {
-          if (operation === 'set') {
-            this.dialogue.setVariable(variableKey, value);
-          } else if (operation === 'add' && typeof value === 'number') {
-            const current = this.dialogue.getVariable(variableKey) || 0;
-            this.dialogue.setVariable(variableKey, current + value);
-          }
-        }
-        break;
-
-      case 'chapter':
-        if (chapterId) {
-          this.save.unlockChapter(chapterId);
-          this.save.setCurrentChapter(chapterId);
-        }
-        break;
-    }
+  public executeEffects(effects: DialogueEffect[], source?: string): EffectsExecutionResult {
+    const result = this.effect.execute(effects, source);
+    return result;
   }
 
-  private applyQuestRewards(characterId: string, rewards: QuestReward[]): void {
-    rewards.forEach((reward) => {
+  public applyQuestRewards(
+    characterId: string,
+    rewards: (QuestReward | DialogueEffect)[]
+  ): {
+    exp: number;
+    gold: number;
+    items: { itemId: string; quantity: number }[];
+    attributes: { id: string; value: number }[];
+    affinity: { characterId: string; value: number }[];
+    effects?: any;
+  } {
+    const summary: {
+      exp: number;
+      gold: number;
+      items: { itemId: string; quantity: number }[];
+      attributes: { id: string; value: number }[];
+      affinity: { characterId: string; value: number }[];
+      effects?: any;
+    } = {
+      exp: 0,
+      gold: 0,
+      items: [] as { itemId: string; quantity: number }[],
+      attributes: [] as { id: string; value: number }[],
+      affinity: [] as { characterId: string; value: number }[],
+    };
+
+    const questRewardTypes = new Set(['exp', 'item', 'gold', 'attribute', 'affinity']);
+    const pureRewards: QuestReward[] = [];
+    const pureEffects: DialogueEffect[] = [];
+
+    (rewards as any[]).forEach((r) => {
+      if (questRewardTypes.has(r.type)) {
+        pureRewards.push(r);
+      } else {
+        pureEffects.push(r);
+      }
+    });
+
+    pureRewards.forEach((reward) => {
+      if (
+        typeof reward.value !== 'number' ||
+        isNaN(reward.value) ||
+        !isFinite(reward.value)
+      )
+        return;
+
+      const safeValue = Math.max(0, reward.value);
+
       switch (reward.type) {
-        case 'exp':
-          this.character.addExp(characterId, reward.value);
+        case 'exp': {
+          this.character.addExp(characterId, safeValue);
+          summary.exp += safeValue;
           break;
-        case 'item':
+        }
+        case 'item': {
           if (reward.itemId) {
-            this.inventory.addItem(reward.itemId, reward.quantity || 1);
+            const qtyFromQuantity = typeof reward.quantity === 'number' ? reward.quantity : null;
+            const qtyFromValue = safeValue > 0 ? safeValue : null;
+            const qty = Math.max(1, qtyFromQuantity ?? qtyFromValue ?? 1);
+            const ok = this.inventory.addItem(reward.itemId, qty);
+            if (ok) summary.items.push({ itemId: reward.itemId, quantity: qty });
           }
           break;
-        case 'gold':
-          this.inventory.addGold(reward.value);
+        }
+        case 'gold': {
+          this.inventory.addGold(safeValue);
+          summary.gold += safeValue;
           break;
-        case 'attribute':
+        }
+        case 'attribute': {
           if (reward.attributeId) {
-            this.character.addAttribute(characterId, reward.attributeId, reward.value);
+            this.character.addAttribute(characterId, reward.attributeId, safeValue);
+            summary.attributes.push({ id: reward.attributeId, value: safeValue });
           }
           break;
-        case 'affinity':
-          this.character.addAffinity(
-            reward.characterId || characterId,
-            reward.value
-          );
+        }
+        case 'affinity': {
+          const cid = reward.characterId ?? characterId;
+          this.character.addAffinity(cid, safeValue);
+          summary.affinity.push({ characterId: cid, value: safeValue });
           break;
+        }
       }
     });
-  }
 
-  createPlayer(config: Omit<CharacterConfig, 'isPlayer'>): CharacterData {
-    return this.character.createCharacter({
-      ...config,
-      isPlayer: true,
-    });
-  }
-
-  addCompanion(config: CharacterConfig): CharacterData {
-    return this.character.createCharacter({
-      ...config,
-      isPlayer: false,
-    });
-  }
-
-  startQuest(questId: string): boolean {
-    const success = this.quest.startQuest(questId);
-    if (success) {
-      this.save.autoSaveIfEnabled();
+    if (pureEffects.length) {
+      summary.effects = this.effect.execute(pureEffects, 'quest_reward');
     }
-    return success;
+
+    return summary;
   }
 
-  completeQuest(questId: string): boolean {
+  public createPlayer(config: Omit<CharacterConfig, 'isPlayer'>): CharacterData {
+    return this.character.createCharacter({ ...config, isPlayer: true });
+  }
+
+  public addCompanion(config: CharacterConfig): CharacterData {
+    return this.character.createCharacter({ ...config, isPlayer: false });
+  }
+
+  public startQuest(questId: string): boolean {
+    const ok = this.quest.startQuest(questId);
+    if (ok) this.save.autoSaveIfEnabled();
+    return ok;
+  }
+
+  public completeQuest(questId: string): boolean {
     const rewards = this.quest.completeQuest(questId);
-    if (rewards) {
-      const player = this.character.getPlayerCharacter();
-      if (player) {
-        this.applyQuestRewards(player.id, rewards);
-      }
-      return true;
-    }
-    return false;
+    return rewards !== null;
   }
 
-  updateQuestObjective(
-    questId: string,
-    objectiveId: string,
-    count: number = 1
-  ): boolean {
+  public claimQuestRewards(questId: string): QuestReward[] | null {
+    return this.quest.claimQuestRewards(questId);
+  }
+
+  public updateQuestObjective(questId: string, objectiveId: string, count: number = 1): boolean {
     return this.quest.updateObjective(questId, objectiveId, count);
   }
 
-  startDialogue(dialogueId: string): DialogueConfig | null {
+  public reportKill(enemyId: string, count: number = 1): void {
+    this.quest.reportKill(enemyId, count);
+  }
+
+  public reportCollect(itemId: string, count: number = 1): void {
+    this.quest.reportCollect(itemId, count);
+  }
+
+  public reportTalk(npcId: string): void {
+    this.quest.reportTalk(npcId);
+  }
+
+  public reportReach(locationId: string): void {
+    this.quest.reportReach(locationId);
+  }
+
+  public reportCustom(customId: string, count: number = 1): void {
+    this.quest.reportCustom(customId, count);
+  }
+
+  public startDialogue(dialogueId: string): DialogueConfig | null {
     return this.dialogue.startDialogue(dialogueId);
   }
 
-  selectDialogueChoice(choiceId: string): DialogueConfig | null {
+  public selectDialogueChoice(choiceId: string): DialogueConfig | null {
     return this.dialogue.selectChoice(choiceId);
   }
 
-  nextDialogue(): DialogueConfig | null {
-    return this.dialogue.next();
+  public nextDialogue(): DialogueConfig | null {
+    const result = this.dialogue.next() as any;
+    return result?.dialogue ?? null;
   }
 
-  getAvailableChoices(): DialogueChoice[] {
+  public getAvailableChoices(): DialogueChoice[] {
     return this.dialogue.getAvailableChoices();
   }
 
-  startBattle(battleId: string): BattleState | null {
+  public startBattle(battleId: string): BattleState | null {
     return this.battle.startBattle(battleId);
   }
 
-  executeBattleAction(action: BattleAction): any {
+  public executeBattleAction(action: BattleAction): any {
     return this.battle.executeAction(action);
   }
 
-  retryBattle(): BattleState | null {
+  public retryBattle(): BattleState | null {
     return this.battle.retryBattle();
   }
 
-  createSave(slotId: string): SaveData | null {
-    return this.save.createSave(slotId);
+  public async createSave(slotId: string): Promise<SaveData | null> {
+    const result = await this.save.createSave(slotId);
+    this.emit('saveCreated', { saveId: slotId, save: result });
+    return result;
   }
 
-  loadSave(slotId: string): boolean {
-    const success = this.save.loadSave(slotId);
-    if (success) {
+  public async loadSave(slotId: string): Promise<boolean> {
+    const ok = await this.save.loadSave(slotId);
+    if (ok) {
       this.achievement.triggerCheck();
     }
-    return success;
+    return ok;
   }
 
-  quickSave(): SaveData | null {
-    return this.save.createSave('quicksave');
+  public async deleteSave(slotId: string): Promise<boolean> {
+    return this.save.deleteSave(slotId);
   }
 
-  quickLoad(): boolean {
-    return this.save.loadSave('quicksave');
+  public async quickSave(): Promise<SaveData | null> {
+    return this.createSave('quicksave');
   }
 
-  getSaveSlots(): SaveSlotInfo[] {
+  public async quickLoad(): Promise<boolean> {
+    return this.loadSave('quicksave');
+  }
+
+  public async getSaveSlots(): Promise<SaveSlotInfo[]> {
     return this.save.getSaveSlotInfos();
   }
 
-  unlockAchievement(achievementId: string): boolean {
+  public exportSave(slotId: string, includeChecksum: boolean = true): string | null {
+    return (this.save as any).exportSave?.(slotId, includeChecksum) ?? null;
+  }
+
+  public exportAllSaves(): string | null {
+    return (this.save as any).exportAllSaves?.() ?? null;
+  }
+
+  public importSave(
+    jsonString: string,
+    options?: { overwrite?: boolean; slotId?: string }
+  ): Promise<SaveData | null> {
+    return (this.save as any).importSave?.(jsonString, options) ?? Promise.resolve(null);
+  }
+
+  public importAllSaves(jsonString: string): Promise<number> {
+    return (this.save as any).importAllSaves?.(jsonString).then((arr: any[]) => arr.length) ?? Promise.resolve(0);
+  }
+
+  public setSaveAdapter(adapter: SaveStorageAdapter): void {
+    (this.save as any).setAdapter?.(adapter);
+  }
+
+  public addSaveMigration(migration: SaveMigration): void {
+    (this.save as any).addMigration?.(migration);
+  }
+
+  public unlockAchievement(achievementId: string): boolean {
     return this.achievement.unlockAchievement(achievementId);
   }
 
-  checkAchievements(): string[] {
+  public checkAchievements(): string[] {
     return this.achievement.checkAllAchievements();
   }
 
-  setVariable(key: string, value: any): void {
+  public setVariable(key: string, value: any): void {
     this.dialogue.setVariable(key, value);
   }
 
-  getVariable(key: string): any {
+  public getVariable(key: string): any {
     return this.dialogue.getVariable(key);
   }
 
-  unlockChapter(chapterId: string): boolean {
-    return this.save.unlockChapter(chapterId);
+  public unlockChapter(chapterId: string): boolean {
+    const ok = this.save.unlockChapter(chapterId);
+    if (ok) {
+      const chapter = this.save.getChapter(chapterId);
+      if (chapter?.onEnterEffects?.length) {
+        this.executeEffects(chapter.onEnterEffects, 'chapter_unlock');
+      }
+    }
+    return ok;
   }
 
-  getCurrentChapter(): ChapterConfig | undefined {
+  public setCurrentChapter(chapterId: string): boolean {
+    const current = this.save.getCurrentChapterId();
+    const ok = this.save.setCurrentChapter(chapterId);
+    if (ok && current !== chapterId) {
+      const chapter = this.save.getChapter(chapterId);
+      if (chapter?.onEnterEffects?.length) {
+        this.executeEffects(chapter.onEnterEffects, 'chapter_set');
+      }
+      this.emit('chapterEntered', { chapterId, chapter });
+    }
+    return ok;
+  }
+
+  public getCurrentChapter(): ChapterConfig | undefined {
     return this.save.getCurrentChapter();
   }
 
-  checkEnding(): EndingConfig | null {
+  public completeChapter(chapterId: string): boolean {
+    const chapter = this.save.getChapter(chapterId);
+    if (!chapter) return false;
+    if (chapter.onCompleteEffects?.length) {
+      this.executeEffects(chapter.onCompleteEffects, 'chapter_complete');
+    }
+    if (chapter.endingId) {
+      this.save.triggerEnding(chapter.endingId);
+    }
+    return true;
+  }
+
+  public checkEnding(): EndingConfig | null {
     return this.save.checkEndingConditions((condition) =>
       this.checkDialogueCondition(condition)
     );
+  }
+
+  public triggerEnding(endingId: string): boolean {
+    const ending = this.save.getEnding(endingId);
+    if (ending?.effects?.length) {
+      this.executeEffects(ending.effects, 'ending');
+    }
+    const ok = this.save.triggerEnding(endingId);
+    this.save.autoSaveIfEnabled();
+    return ok;
   }
 
   private checkDialogueCondition(condition: DialogueCondition): boolean {
@@ -541,57 +736,67 @@ export class RPGCore extends EventEmitter {
     }
   }
 
-  addItemConfig(config: ItemConfig): void {
+  public addItemConfig(config: ItemConfig): void {
     this.inventory.addItemConfig(config);
   }
 
-  addQuestConfig(config: QuestConfig): void {
+  public addSkillConfig(config: SkillConfig): void {
+    this.battle.addSkillConfig(config);
+  }
+
+  public addQuestConfig(config: QuestConfig): void {
     this.quest.addQuestConfig(config);
   }
 
-  addDialogueConfig(config: DialogueConfig): void {
+  public addDialogueConfig(config: DialogueConfig): void {
     this.dialogue.addDialogueConfig(config);
   }
 
-  addCharacterConfig(config: CharacterConfig): void {
+  public addCharacterConfig(config: CharacterConfig): void {
     this.character.createCharacter(config);
   }
 
-  addAchievementConfig(config: AchievementConfig): void {
+  public addAchievementConfig(config: AchievementConfig): void {
     this.achievement.addAchievement(config);
   }
 
-  addChapterConfig(config: ChapterConfig): void {
+  public addChapterConfig(config: ChapterConfig): void {
     this.save.addChapter(config);
   }
 
-  addEndingConfig(config: EndingConfig): void {
+  public addEndingConfig(config: EndingConfig): void {
     this.save.addEnding(config);
   }
 
-  addBattleConfig(config: BattleConfig): void {
+  public addBattleConfig(config: BattleConfig): void {
     this.battle.addBattleConfig(config);
   }
 
-  addAttributeConfig(config: AttributeConfig): void {
+  public addAttributeConfig(config: AttributeConfig): void {
     this.attribute.addAttributeConfig(config);
   }
 
-  addLevelConfig(config: LevelConfig): void {}
-
-  addGold(amount: number): number {
+  public addGold(amount: number): number {
     return this.inventory.addGold(amount);
   }
 
-  spendGold(amount: number): boolean {
+  public spendGold(amount: number): boolean {
     return this.inventory.spendGold(amount);
   }
 
-  getGold(): number {
+  public getGold(): number {
     return this.inventory.getGold();
   }
 
-  reset(): void {
+  public setGold(amount: number): number {
+    return this.inventory.setGold(amount);
+  }
+
+  public addExp(characterId: string, exp: number): { leveledUp: boolean; levelsGained: number } {
+    return this.character.addExp(characterId, exp);
+  }
+
+  public reset(): void {
     this.attribute.reset();
     this.inventory.clear();
     this.quest.resetAllQuests();
@@ -600,35 +805,35 @@ export class RPGCore extends EventEmitter {
     this.battleResults.clear();
   }
 
-  getPlayer(): CharacterData | undefined {
+  public getPlayer(): CharacterData | undefined {
     return this.character.getPlayerCharacter();
   }
 
-  getCompanions(): CharacterData[] {
+  public getCompanions(): CharacterData[] {
     return this.character.getAllCharacters().filter((c) => !c.isPlayer);
   }
 
-  getQuests(): QuestData[] {
+  public getQuests(): QuestData[] {
     return this.quest.getAllQuests();
   }
 
-  getActiveQuests(): QuestData[] {
+  public getActiveQuests(): QuestData[] {
     return this.quest.getActiveQuests();
   }
 
-  getCompletedQuests(): QuestData[] {
+  public getCompletedQuests(): QuestData[] {
     return this.quest.getCompletedQuests();
   }
 
-  getInventory(): InventoryItem[] {
+  public getInventory(): InventoryItem[] {
     return this.inventory.getAllItems();
   }
 
-  getUnlockedAchievements(): AchievementConfig[] {
+  public getUnlockedAchievements(): AchievementConfig[] {
     return this.achievement.getUnlockedAchievements();
   }
 
-  getAchievementProgress(): {
+  public getAchievementProgress(): {
     unlocked: number;
     total: number;
     percentage: number;
@@ -636,11 +841,35 @@ export class RPGCore extends EventEmitter {
     return this.achievement.getProgress();
   }
 
-  on(event: RPGEventType, callback: EventCallback): () => void {
+  public addSkill(characterId: string, skillId: string): boolean {
+    return this.character.addSkill(characterId, skillId);
+  }
+
+  public learnSkill(characterId: string, skillId: string): boolean {
+    const skill = this.battle.getSkillConfig(skillId);
+    const level = this.character.getLevel(characterId);
+    if (skill?.requiredLevel && level < skill.requiredLevel) return false;
+    return this.character.addSkill(characterId, skillId);
+  }
+
+  public on(event: RPGEventType, callback: EventCallback): () => void {
     return super.on(event, callback);
   }
 
-  toJSON(): {
+  public onAny(callback: EventCallback): () => void {
+    return super.on('*' as any, callback);
+  }
+
+  public destroy(): void {
+    if (this.autoSaveTimer) {
+      clearInterval(this.autoSaveTimer);
+      this.autoSaveTimer = null;
+    }
+    (this.save as any).stopPlayTimeCounter?.();
+    this.removeAllListeners();
+  }
+
+  public toJSON(): {
     characters: CharacterData[];
     inventory: { items: InventoryItem[]; gold: number };
     quests: QuestData[];

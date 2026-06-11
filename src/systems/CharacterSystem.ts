@@ -4,6 +4,7 @@ import {
   LevelConfig,
   AttributeData,
   QuestReward,
+  AttributeConfig,
 } from '../types';
 import { EventEmitter } from './EventEmitter';
 
@@ -11,38 +12,67 @@ export class CharacterSystem extends EventEmitter {
   private characters: Map<string, CharacterData> = new Map();
   private levelTable: LevelConfig[] = [];
   private maxLevel: number = 99;
+  private defaultAttributes: AttributeConfig[] = [];
 
   constructor(
     configs: CharacterConfig[] = [],
     levelTable: LevelConfig[] = [],
-    maxLevel: number = 99
+    maxLevel: number = 99,
+    defaultAttributes: AttributeConfig[] = []
   ) {
     super();
     this.levelTable = levelTable;
     this.maxLevel = maxLevel;
+    this.defaultAttributes = defaultAttributes;
     configs.forEach((config) => this.createCharacter(config));
+  }
+
+  private isValidNumber(n: any): boolean {
+    return typeof n === 'number' && !isNaN(n) && isFinite(n);
+  }
+
+  private sanitizeAmount(
+    n: number,
+    min: number = 0,
+    max: number = Infinity
+  ): number {
+    if (!this.isValidNumber(n)) return min;
+    return Math.min(Math.max(min, n), max);
+  }
+
+  private getAttributeConfig(attributeId: string): AttributeConfig | undefined {
+    return this.defaultAttributes.find((a) => a.id === attributeId);
   }
 
   createCharacter(config: CharacterConfig): CharacterData {
     const attributes: Record<string, number> = {};
     if (config.initialAttributes) {
       config.initialAttributes.forEach((attr: AttributeData) => {
-        attributes[attr.id] = attr.value;
+        const attrConfig = this.getAttributeConfig(attr.id);
+        const min = attrConfig?.minValue ?? 0;
+        const max = attrConfig?.maxValue ?? Infinity;
+        attributes[attr.id] = this.sanitizeAmount(attr.value, min, max);
       });
     }
+
+    const initialLevel = this.sanitizeAmount(config.initialLevel ?? 1, 1, this.maxLevel);
+    const initialExp = this.sanitizeAmount(config.initialExp ?? 0, 0);
+    const affinityMax = this.sanitizeAmount(config.affinityMax ?? 100, 0);
+    const initialAffinity = this.sanitizeAmount(config.affinity ?? 0, 0, affinityMax);
 
     const character: CharacterData = {
       id: config.id,
       name: config.name,
       avatar: config.avatar,
       description: config.description,
-      level: config.initialLevel ?? 1,
-      exp: config.initialExp ?? 0,
+      level: initialLevel,
+      exp: initialExp,
       attributes,
-      affinity: config.affinity ?? 0,
-      affinityMax: config.affinityMax ?? 100,
+      affinity: initialAffinity,
+      affinityMax,
       isPlayer: config.isPlayer ?? false,
       skills: [],
+      skillCooldowns: {},
     };
 
     this.characters.set(config.id, character);
@@ -87,19 +117,28 @@ export class CharacterSystem extends EventEmitter {
     const character = this.getCharacter(characterId);
     if (!character) return 0;
 
-    const oldValue = character.attributes[attributeId] ?? 0;
-    character.attributes[attributeId] = value;
+    if (!this.isValidNumber(value)) {
+      return character.attributes[attributeId] ?? 0;
+    }
 
-    if (oldValue !== value) {
+    const attrConfig = this.getAttributeConfig(attributeId);
+    const min = attrConfig?.minValue ?? 0;
+    const max = attrConfig?.maxValue ?? Infinity;
+    const clampedValue = this.sanitizeAmount(value, min, max);
+
+    const oldValue = character.attributes[attributeId] ?? 0;
+    character.attributes[attributeId] = clampedValue;
+
+    if (oldValue !== clampedValue) {
       this.emit('attributeChange', {
         characterId,
         attributeId,
         oldValue,
-        newValue: value,
+        newValue: clampedValue,
       });
     }
 
-    return value;
+    return clampedValue;
   }
 
   addAttribute(
@@ -107,6 +146,9 @@ export class CharacterSystem extends EventEmitter {
     attributeId: string,
     amount: number
   ): number {
+    if (!this.isValidNumber(amount)) {
+      return this.getAttribute(characterId, attributeId);
+    }
     const current = this.getAttribute(characterId, attributeId);
     return this.setAttribute(characterId, attributeId, current + amount);
   }
@@ -120,6 +162,7 @@ export class CharacterSystem extends EventEmitter {
   }
 
   getExpRequiredForLevel(level: number): number {
+    if (!this.isValidNumber(level) || level < 1) return 0;
     const config = this.levelTable.find((l) => l.level === level);
     if (config) return config.expRequired;
     return Math.floor(100 * Math.pow(1.5, level - 1));
@@ -135,10 +178,16 @@ export class CharacterSystem extends EventEmitter {
 
   addExp(characterId: string, exp: number): { leveledUp: boolean; levelsGained: number } {
     const character = this.getCharacter(characterId);
-    if (!character || exp <= 0) return { leveledUp: false, levelsGained: 0 };
+    if (!character) return { leveledUp: false, levelsGained: 0 };
+
+    if (!this.isValidNumber(exp) || exp <= 0) {
+      return { leveledUp: false, levelsGained: 0 };
+    }
+
     if (character.level >= this.maxLevel) return { leveledUp: false, levelsGained: 0 };
 
-    character.exp += exp;
+    const safeExp = this.sanitizeAmount(exp, 0);
+    character.exp += safeExp;
     let levelsGained = 0;
 
     while (character.level < this.maxLevel) {
@@ -170,7 +219,9 @@ export class CharacterSystem extends EventEmitter {
     const character = this.getCharacter(characterId);
     if (!character) return;
 
-    character.level = Math.min(Math.max(1, level), this.maxLevel);
+    if (!this.isValidNumber(level)) return;
+
+    character.level = this.sanitizeAmount(level, 1, this.maxLevel);
     character.exp = 0;
   }
 
@@ -182,10 +233,15 @@ export class CharacterSystem extends EventEmitter {
     const character = this.getCharacter(characterId);
     if (!character) return 0;
 
+    if (!this.isValidNumber(amount)) {
+      return character.affinity;
+    }
+
     const oldValue = character.affinity;
-    character.affinity = Math.min(
-      character.affinityMax,
-      Math.max(0, character.affinity + amount)
+    character.affinity = this.sanitizeAmount(
+      character.affinity + amount,
+      0,
+      character.affinityMax
     );
 
     if (oldValue !== character.affinity) {
@@ -203,11 +259,12 @@ export class CharacterSystem extends EventEmitter {
     const character = this.getCharacter(characterId);
     if (!character) return 0;
 
+    if (!this.isValidNumber(value)) {
+      return character.affinity;
+    }
+
     const oldValue = character.affinity;
-    character.affinity = Math.min(
-      character.affinityMax,
-      Math.max(0, value)
-    );
+    character.affinity = this.sanitizeAmount(value, 0, character.affinityMax);
 
     if (oldValue !== character.affinity) {
       this.emit('affinityChange', {
@@ -240,8 +297,39 @@ export class CharacterSystem extends EventEmitter {
     return this.getCharacter(characterId)?.skills.includes(skillId) ?? false;
   }
 
+  getSkillCooldown(characterId: string, skillId: string): number {
+    const character = this.getCharacter(characterId);
+    if (!character) return 0;
+    return character.skillCooldowns[skillId] ?? 0;
+  }
+
+  setSkillCooldown(characterId: string, skillId: string, cooldown: number): boolean {
+    const character = this.getCharacter(characterId);
+    if (!character) return false;
+
+    const safeCooldown = this.isValidNumber(cooldown)
+      ? this.sanitizeAmount(cooldown, 0)
+      : 0;
+
+    character.skillCooldowns[skillId] = safeCooldown;
+    return true;
+  }
+
+  decrementSkillCooldowns(): void {
+    this.characters.forEach((character) => {
+      Object.keys(character.skillCooldowns).forEach((skillId) => {
+        const current = character.skillCooldowns[skillId];
+        if (current > 0) {
+          character.skillCooldowns[skillId] = current - 1;
+        }
+      });
+    });
+  }
+
   applyRewards(characterId: string, rewards: QuestReward[]): void {
     rewards.forEach((reward) => {
+      if (!this.isValidNumber(reward.value)) return;
+
       switch (reward.type) {
         case 'exp':
           this.addExp(characterId, reward.value);
