@@ -783,6 +783,430 @@ assert(rpg5.getGold() === 200, 'setGold(0) 后 addGold(200) → 200（前一步 
 console.log('\n第五部分完成');
 
 // ============================================================
+section('第六部分：V3 新增需求验证');
+// ============================================================
+console.log('\n--- 6.1 任务奖励混合类型 + 详细结果 ---');
+const rpg6 = new RPGCore({
+  initialGold: 0,
+  defaultAttributes: [{ id: 'hp', name: 'HP' }, { id: 'maxHp', name: 'MaxHP' }, { id: 'attack', name: '攻击' }, { id: 'defense', name: '防御' }, { id: 'speed', name: '速度' }],
+  items: [
+    { id: 'potion', name: '药水', type: 'consumable', stackable: true, maxStack: 99, usable: false },
+    { id: 'gem', name: '宝石', type: 'material', stackable: true, maxStack: 99, usable: false },
+  ],
+  characters: [
+    { id: 'hero', name: '勇者', isPlayer: true, initialLevel: 1,
+      initialAttributes: [
+        { id: 'maxHp', value: 500 }, { id: 'hp', value: 500 },
+        { id: 'attack', value: 50 }, { id: 'defense', value: 20 }, { id: 'speed', value: 15 },
+      ] },
+  ],
+  quests: [
+    {
+      id: 'v3_auto', name: 'V3 自动完成任务', autoStart: true, autoComplete: true,
+      objectives: [
+        { id: 'o_kill', type: 'kill', targetId: 'slime', targetCount: 5 },
+      ],
+      rewards: [
+        { type: 'gold', value: 200 },
+        { type: 'item', itemId: 'gem', quantity: 3 },
+        { type: 'exp', value: 50 },
+        { type: 'variable', variableKey: 'v3_reward_given', value: true, operation: 'set' },
+        { type: 'gold', value: 999, operation: 'set' },
+        { type: 'item', itemId: 'potion', value: 7, operation: 'set' },
+        { type: 'gold', value: -100 }, // 非法值，应失败
+        { type: 'item', itemId: 'nonexistent', quantity: 1 }, // 不存在的道具，应失败
+      ],
+    },
+    {
+      id: 'v3_manual', name: 'V3 手动认领任务', autoStart: true, autoComplete: false,
+      objectives: [
+        { id: 'o_collect', type: 'collect', targetId: 'herb', targetCount: 3 },
+      ],
+      rewards: [
+        { type: 'gold', value: 500 },
+        { type: 'variable', variableKey: 'v3_manual_done', value: true, operation: 'set' },
+      ],
+    },
+  ],
+});
+
+await new Promise(r => setTimeout(r, 50));
+rpg6.setVariable('v3_reward_given', false);
+
+// 测试自动完成 + 自动发奖
+rpg6.reportKill('slime', 5);
+const qAuto = rpg6.quest.getQuest('v3_auto');
+assert(qAuto.status === 'completed', 'v3 自动任务完成 (status=' + qAuto.status + ')');
+assert(qAuto.claimedRewards === true, 'autoComplete 已自动领取奖励');
+assert(rpg6.getGold() === 999, '金币最终被 set 为 999（不是 200+999=1199）');
+assert(rpg6.inventory.getItemCount('potion') === 7, '药水被 set 为 7（不是累加）');
+assert(rpg6.inventory.getItemCount('gem') === 3, '宝石 +3');
+assert(rpg6.getVariable('v3_reward_given') === true, '变量设置成功');
+
+// 测试手动完成 + 认领，返回详细结果
+rpg6.reportCollect('herb', 3);
+const qBefore = rpg6.quest.getQuest('v3_manual');
+assert(qBefore.status === 'active', '完成目标后 status 仍为 active（autoComplete=false）');
+assert(qBefore.claimedRewards !== true, 'claimedRewards 为 false，等待手动认领');
+
+const completeRes = rpg6.completeQuest('v3_manual');
+assert(completeRes !== null, 'completeQuest 返回执行结果（不是 null）');
+assert(completeRes.rewards.success.length === 1, '1 项纯奖励成功（gold 500）');
+assert(completeRes.rewards.failed.length === 0, '0 项奖励失败');
+assert(completeRes.effects !== undefined, '包含 effects 执行结果');
+assert(completeRes.effects.totalSuccess === 1, '1 项剧情效果成功（variable）');
+assert(completeRes.allSuccess === true, 'allSuccess = true');
+assert(completeRes.totalSuccess === 2, '总成功 = 2');
+assert(completeRes.totalFailed === 0, '总失败 = 0');
+
+const qManual = rpg6.quest.getQuest('v3_manual');
+assert(qManual.status === 'completed', 'completeQuest 后 status = completed');
+assert(qManual.claimedRewards === true, 'claimedRewards 已标记为 true');
+assert(rpg6.getVariable('v3_manual_done') === true, '变量设置成功');
+assert(rpg6.getGold() === 999 + 500, '金币 +500 → 1499（实际=' + rpg6.getGold() + '）');
+
+// 再次 claimQuestRewards，应该返回 null（已领过）
+const claimAgain = rpg6.claimQuestRewards('v3_manual');
+assert(claimAgain === null, '重复 claim 返回 null');
+
+console.log('\n--- 6.2 剧情效果 quest progress 操作 + 参数校验 ---');
+const rpg6b = new RPGCore({
+  defaultAttributes: [{ id: 'hp', name: 'HP' }, { id: 'maxHp', name: 'MaxHP' }],
+  characters: [{ id: 'hero', name: '勇者', isPlayer: true, initialLevel: 1, initialAttributes: [{ id: 'maxHp', value: 100 }, { id: 'hp', value: 100 }] }],
+  quests: [
+    { id: 'q_progress', name: '进度测试', autoStart: true, objectives: [
+      { id: 'kill_wolf', type: 'kill', targetId: 'wolf', targetCount: 10 },
+      { id: 'collect_herb', type: 'collect', targetId: 'herb', targetCount: 5 },
+      { id: 'talk_elder', type: 'talk', targetId: 'elder', targetCount: 1 },
+    ] },
+  ],
+});
+
+await new Promise(r => setTimeout(r, 50));
+
+// 正常推进：指定目标 + 数量
+const res1 = rpg6b.executeEffects([
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'kill_wolf', value: 3 },
+]);
+assert(res1.totalSuccess === 1, '推进狼击杀 +3 成功');
+assert(rpg6b.quest.getQuest('q_progress').objectives[0].currentCount === 3, '狼击杀 = 3');
+
+// 连续推进：多次推进，幂等累加（注意 set 语义是累加，但 quest progress 本身是累加）
+const res2 = rpg6b.executeEffects([
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'collect_herb', value: 2 },
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'collect_herb', value: 3 },
+]);
+assert(res2.totalSuccess === 2, '推进草药 2+3 成功');
+const herbObj = rpg6b.quest.getQuest('q_progress').objectives[1];
+assert(herbObj.currentCount === 5, '草药 = 5，已完成');
+assert(herbObj.currentCount <= herbObj.targetCount, '不会超过 targetCount');
+
+// 参数校验：缺少 objectiveId
+const resBad1 = rpg6b.executeEffects([
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', value: 2 },
+]);
+assert(resBad1.totalSuccess === 0, '缺少 objectiveId → 失败');
+assert(resBad1.totalFailed === 1, '失败计数=1');
+assert(resBad1.results[0].success === false, 'result.success=false');
+assert(resBad1.results[0].error !== undefined, '有 error 信息');
+
+// 参数校验：缺少 value
+const resBad2 = rpg6b.executeEffects([
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'talk_elder' },
+]);
+assert(resBad2.totalSuccess === 0, '缺少 value → 失败');
+
+// 参数校验：value 是 NaN / 负数
+const resBad3 = rpg6b.executeEffects([
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'talk_elder', value: NaN },
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'talk_elder', value: -1 },
+]);
+assert(resBad3.totalSuccess === 0, '非法 value → 失败');
+assert(rpg6b.quest.getQuest('q_progress').objectives[2].currentCount === 0, '对话进度仍为 0');
+
+// 任务不存在
+const resBad4 = rpg6b.executeEffects([
+  { type: 'quest', questId: 'nonexistent', questAction: 'progress', objectiveId: 'x', value: 1 },
+]);
+assert(resBad4.totalSuccess === 0, '任务不存在 → 失败');
+
+// 推进到完成
+const resComplete = rpg6b.executeEffects([
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'kill_wolf', value: 10 },
+  { type: 'quest', questId: 'q_progress', questAction: 'progress', objectiveId: 'talk_elder', value: 1 },
+]);
+assert(resComplete.totalSuccess === 2, '推进到完成');
+const killObj = rpg6b.quest.getQuest('q_progress').objectives[0];
+assert(killObj.currentCount === 10, '击杀被 clamp 到 targetCount=10');
+
+console.log('\n--- 6.3 Buff/Debuff 真影响战斗（攻击/防御/速度）---');
+const rpg6c = new RPGCore({
+  initialGold: 0,
+  defaultAttributes: [
+    { id: 'hp', name: 'HP' }, { id: 'maxHp', name: 'MaxHP' },
+    { id: 'mp', name: 'MP' }, { id: 'maxMp', name: 'MaxMP' },
+    { id: 'attack', name: '攻击' }, { id: 'defense', name: '防御' }, { id: 'speed', name: '速度' },
+  ],
+  items: [],
+  characters: [
+    { id: 'hero', name: '勇者', isPlayer: true, initialLevel: 1,
+      initialAttributes: [
+        { id: 'maxHp', value: 500 }, { id: 'hp', value: 500 },
+        { id: 'maxMp', value: 100 }, { id: 'mp', value: 100 },
+        { id: 'attack', value: 50 }, { id: 'defense', value: 20 }, { id: 'speed', value: 15 },
+      ],
+      skills: ['attack_up', 'defense_down', 'speed_up', 'poison_strike', 'normal_attack'],
+    },
+  ],
+  skills: [
+    { id: 'normal_attack', name: '普通攻击', type: 'damage', mpCost: 0, cooldown: 0,
+      damageMultiplier: 1.0, targetType: 'single_enemy' },
+    { id: 'attack_up', name: '战斗怒吼', type: 'buff', mpCost: 10, cooldown: 3, targetType: 'self',
+      effects: [{ type: 'buff', attributeId: 'attack', value: 25, duration: 3, name: '攻击提升' }] },
+    { id: 'defense_down', name: '破甲打击', type: 'damage', mpCost: 15, cooldown: 2,
+      damageMultiplier: 0.8, targetType: 'single_enemy',
+      effects: [{ type: 'debuff', attributeId: 'defense', value: 12, duration: 2, name: '破甲' }] },
+    { id: 'speed_up', name: '疾风步', type: 'buff', mpCost: 20, cooldown: 4, targetType: 'self',
+      effects: [{ type: 'buff', attributeId: 'speed', value: 50, duration: 3, name: '加速' }] },
+    { id: 'poison_strike', name: '毒击', type: 'damage', mpCost: 8, cooldown: 2,
+      damageMultiplier: 0.6, targetType: 'single_enemy',
+      effects: [{ type: 'debuff', attributeId: 'hp', value: 0, duration: 3, name: '中毒', dotDamage: 15 }] },
+  ],
+  battles: [
+    { id: 'buff_test_battle', name: '状态效果测试战', allowFlee: false, retryable: true,
+      enemies: [
+        { id: 'training_dummy', name: '训练假人',
+          attributes: { maxHp: 9999, hp: 9999, attack: 10, defense: 30, speed: 5 },
+          expReward: 0, goldReward: 0, loot: [] },
+      ],
+      victoryRewards: [],
+    },
+  ],
+});
+
+await rpg6c.startBattle('buff_test_battle');
+bs = rpg6c.battle.getCurrentBattle();
+assert(bs && bs.turnQueue[0] === 'hero', '初始回合顺序：hero 先（速度 15 > 5）');
+const hero = rpg6c.battle.getPlayerCharacters()[0];
+const dummy = rpg6c.battle.getEnemyCharacters()[0];
+
+// 先看普通攻击伤害：attack(50) - defense(30)*0.5 = 35
+// 先让 dummy 防御一次，保证后续所有攻击都在 defend 状态下，基准一致
+await rpg6c.battle.executeAction({ type: 'defend', characterId: 'hero' });
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+bs = rpg6c.battle.getCurrentBattle();
+assert(bs && bs.turn === 2, '第 2 回合开始（基准测试）');
+let normalDmg = 0;
+for (let i = 0; i < 5; i++) {
+  const r = await rpg6c.battle.executeAction({ type: 'attack', characterId: 'hero', targetId: 'training_dummy' });
+  await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+  normalDmg += r?.damage || 0;
+  if (dummy.currentHp < 1000) break;
+}
+const avgNormal = Math.round(normalDmg / Math.min(5, normalDmg > 0 ? 5 : 1));
+console.log('  （无 Buff 普攻平均伤害: ' + avgNormal + '，预计约 17-18，假人防御）');
+
+// 重试战斗，保证干净新开局
+await rpg6c.battle.retryBattle();
+bs = rpg6c.battle.getCurrentBattle();
+const hero2 = rpg6c.battle.getPlayerCharacters()[0];
+const dummy2 = rpg6c.battle.getEnemyCharacters()[0];
+
+// 先放战斗怒吼（攻击 buff +25 → 75）
+const rBuff = await rpg6c.battle.executeAction({ type: 'skill', characterId: 'hero', skillId: 'attack_up', targetId: 'hero' });
+assert(rBuff !== null && rBuff !== undefined, '战斗怒吼施放成功（返回非空）');
+assert(rBuff.skillId === 'attack_up', '返回日志包含 skillId');
+assert(hero2.buffs.length === 1, '英雄获得 1 个 buff（实际=' + hero2.buffs.length + '）');
+assert(hero2.buffs[0] !== undefined, 'buff[0] 存在');
+assert(hero2.buffs[0].attributeId === 'attack' && hero2.buffs[0].value === 25, 'buff: attack +25（3回合）');
+assert(hero2.buffs[0].remainingTurns === 3, '剩余回合 = 3');
+
+// 假人防御
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 下一回合：普攻，应该伤害显著提高（75 - 30*0.5 = 60）
+bs = rpg6c.battle.getCurrentBattle();
+assert(bs && bs.turn === 2, '第 2 回合');
+assert(hero2.buffs[0].remainingTurns === 2, '第 2 回合 buff 剩余 2 回合');
+
+let buffDmg = 0;
+for (let i = 0; i < 3; i++) {
+  const r = await rpg6c.battle.executeAction({ type: 'attack', characterId: 'hero', targetId: 'training_dummy' });
+  await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+  buffDmg += r?.damage || 0;
+  if (dummy2.currentHp < 1000) break;
+}
+const avgBuff = Math.round(buffDmg / 3);
+console.log('  （有攻击 Buff 普攻平均伤害: ' + avgBuff + '，预计约 30）');
+assert(avgBuff > avgNormal * 1.3, '加攻后伤害提升 30% 以上（无buff=' + avgNormal + ', 有buff=' + avgBuff + '）');
+
+// 现在看破甲打击（降低假人防御 12 → 防御 18）
+await rpg6c.battle.retryBattle();
+bs = rpg6c.battle.getCurrentBattle();
+const hero3 = rpg6c.battle.getPlayerCharacters()[0];
+const dummy3 = rpg6c.battle.getEnemyCharacters()[0];
+
+// 先普通攻击一次，拿基准伤害（先让 dummy 防御，保证基准和破甲后都在 defend 状态）
+await rpg6c.battle.executeAction({ type: 'defend', characterId: 'hero' });
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+bs = rpg6c.battle.getCurrentBattle();
+assert(bs && bs.turn === 2, '第 2 回合开始（破甲测试）');
+const rNorm = await rpg6c.battle.executeAction({ type: 'attack', characterId: 'hero', targetId: 'training_dummy' });
+const normDmg = rNorm?.damage || 0;
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 施放破甲
+const rDebuff = await rpg6c.battle.executeAction({ type: 'skill', characterId: 'hero', skillId: 'defense_down', targetId: 'training_dummy' });
+assert(rDebuff?.success === true, '破甲打击成功');
+assert(dummy3.debuffs.length === 1, '假人获得 1 个 debuff');
+assert(dummy3.debuffs[0].attributeId === 'defense' && dummy3.debuffs[0].value === 12, 'debuff: 防御 -12（2回合）');
+assert(dummy3.debuffs[0].remainingTurns === 2, 'debuff 剩余 2 回合');
+
+// 假人防御
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 再普攻，伤害应比原来高（因为防御降低了）
+bs = rpg6c.battle.getCurrentBattle();
+assert(bs && bs.turn === 4, '第 4 回合');
+const rDebuffAtk = await rpg6c.battle.executeAction({ type: 'attack', characterId: 'hero', targetId: 'training_dummy' });
+const debuffDmg = rDebuffAtk?.damage || 0;
+console.log('  （无破甲伤害: ' + normDmg + '，破甲后伤害: ' + debuffDmg + '）');
+assert(debuffDmg > normDmg, '减防后伤害提高（' + normDmg + ' → ' + debuffDmg + '）');
+
+// 加速效果：施放疾风步，英雄速度 15 + 50 = 65，下一回合行动顺序应该两次连续 hero
+await rpg6c.battle.retryBattle();
+bs = rpg6c.battle.getCurrentBattle();
+const hero4 = rpg6c.battle.getPlayerCharacters()[0];
+const dummy4 = rpg6c.battle.getEnemyCharacters()[0];
+
+// 初始顺序
+const tq1 = bs.turnQueue.join(',');
+assert(tq1.startsWith('hero'), '第 1 回合 turnQueue: hero 先（' + tq1 + '）');
+
+// 施放疾风步
+const rSpeed = await rpg6c.battle.executeAction({ type: 'skill', characterId: 'hero', skillId: 'speed_up', targetId: 'hero' });
+assert(rSpeed?.success === true, '疾风步成功');
+assert(hero4.buffs.find(b => b.attributeId === 'speed')?.value === 50, '速度 buff +50');
+
+// 假人行动
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 第 2 回合，turnQueue 重建，hero 速度 65 vs dummy 5 → hero 先，然后 dummy
+bs = rpg6c.battle.getCurrentBattle();
+const tq2 = bs.turnQueue.join(',');
+console.log('  （第 2 回合 turnQueue: ' + tq2 + '）');
+assert(tq2.startsWith('hero,training_dummy'), '加速后 turnQueue 正确（' + tq2 + '）');
+
+// 现在测中毒 DoT：施放毒击，3 回合持续伤害
+await rpg6c.battle.retryBattle();
+bs = rpg6c.battle.getCurrentBattle();
+const hero5 = rpg6c.battle.getPlayerCharacters()[0];
+const dummy5 = rpg6c.battle.getEnemyCharacters()[0];
+
+// 先把假人 HP 设一个固定值方便观察
+dummy5.currentHp = 500;
+dummy5.maxHp = 9999;
+
+const rPoison = await rpg6c.battle.executeAction({ type: 'skill', characterId: 'hero', skillId: 'poison_strike', targetId: 'training_dummy' });
+assert(rPoison?.success === true, '毒击命中');
+assert(dummy5.debuffs.length === 1, '假人获得中毒 debuff');
+assert(dummy5.debuffs[0].name === '中毒' && dummy5.debuffs[0].remainingTurns === 3, '中毒持续 3 回合');
+
+const hpAfterPoison = dummy5.currentHp;
+console.log('  （毒击直接伤害: ' + (500 - hpAfterPoison) + '）');
+
+// 假人防御
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 第 2 回合开始：DoT 触发，扣 15 HP
+bs = rpg6c.battle.getCurrentBattle();
+const hpAfterDot1 = dummy5.currentHp;
+console.log('  （第 2 回合开始 DoT 伤害: ' + (hpAfterPoison - hpAfterDot1) + ' HP，剩余: ' + hpAfterDot1 + '）');
+assert(hpAfterPoison - hpAfterDot1 === 15, 'DoT 第 1 跳伤害 = 15');
+assert(dummy5.debuffs[0].remainingTurns === 2, 'debuff 剩余 2 回合');
+
+// hero 行动后，dummy 行动，再到第 3 回合
+await rpg6c.battle.executeAction({ type: 'defend', characterId: 'hero' });
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 第 3 回合：DoT 第 2 跳
+bs = rpg6c.battle.getCurrentBattle();
+const hpAfterDot2 = dummy5.currentHp;
+assert(hpAfterDot1 - hpAfterDot2 === 15, 'DoT 第 2 跳伤害 = 15');
+assert(dummy5.debuffs[0].remainingTurns === 1, 'debuff 剩余 1 回合');
+
+await rpg6c.battle.executeAction({ type: 'defend', characterId: 'hero' });
+await rpg6c.battle.executeEnemyAction({ type: 'defend', characterId: 'training_dummy' });
+
+// 第 4 回合：DoT 第 3 跳（最后一跳），debuff 到期后应被清除
+bs = rpg6c.battle.getCurrentBattle();
+const hpAfterDot3 = dummy5.currentHp;
+assert(hpAfterDot2 - hpAfterDot3 === 15, 'DoT 第 3 跳伤害 = 15');
+assert(dummy5.debuffs.length === 0, '中毒 debuff 到期后被清除，恢复干净');
+console.log('  （3 回合 DoT 完毕，debuff 已清除，HP: ' + hpAfterDot3 + '）');
+
+console.log('\n--- 6.4 金币/道具 set 语义：覆盖而非累加，幂等 ---');
+const rpg6d = new RPGCore({
+  initialGold: 0,
+  defaultAttributes: [{ id: 'hp', name: 'HP' }, { id: 'maxHp', name: 'MaxHP' }],
+  items: [{ id: 'coin', name: '金币袋', type: 'material', stackable: true, maxStack: 999, usable: false }],
+  characters: [{ id: 'hero', name: '勇者', isPlayer: true, initialLevel: 1, initialAttributes: [{ id: 'maxHp', value: 100 }, { id: 'hp', value: 100 }] }],
+});
+
+// 金币 set：先 add 一些，再 set
+rpg6d.addGold(500);
+assert(rpg6d.getGold() === 500, 'addGold(500) → 500');
+
+// 第一次 set
+const setRes1 = rpg6d.executeEffects([{ type: 'gold', operation: 'set', value: 1000 }]);
+assert(setRes1.totalSuccess === 1, '金币 set 成功');
+assert(rpg6d.getGold() === 1000, '金币 set 为 1000（不是 500+1000=1500）');
+
+// 第二次 set 同一个值，幂等
+const setRes2 = rpg6d.executeEffects([{ type: 'gold', operation: 'set', value: 1000 }]);
+assert(setRes2.totalSuccess === 1, '第二次金币 set 成功');
+assert(rpg6d.getGold() === 1000, '第二次 set 结果仍为 1000（幂等）');
+
+// set 另一个值
+const setRes3 = rpg6d.executeEffects([{ type: 'gold', operation: 'set', value: 777 }]);
+assert(setRes3.totalSuccess === 1, '金币 set 777 成功');
+assert(rpg6d.getGold() === 777, '金币现在是 777');
+
+// 道具 set
+rpg6d.inventory.addItem('coin', 5);
+assert(rpg6d.inventory.getItemCount('coin') === 5, '初始 5 个金币袋');
+
+// 第一次 set
+const setItem1 = rpg6d.executeEffects([{ type: 'item', itemId: 'coin', operation: 'set', value: 20 }]);
+assert(setItem1.totalSuccess === 1, '道具 set 20 成功');
+assert(rpg6d.inventory.getItemCount('coin') === 20, '道具 set 为 20（不是 5+20=25）');
+
+// 第二次 set 同一个值，幂等
+const setItem2 = rpg6d.executeEffects([{ type: 'item', itemId: 'coin', operation: 'set', value: 20 }]);
+assert(setItem2.totalSuccess === 1, '第二次道具 set 成功');
+assert(rpg6d.inventory.getItemCount('coin') === 20, '第二次 set 仍为 20（幂等）');
+
+// set 为 0，清除道具
+const setItem3 = rpg6d.executeEffects([{ type: 'item', itemId: 'coin', operation: 'set', value: 0 }]);
+assert(setItem3.totalSuccess === 1, '道具 set 0 成功');
+assert(rpg6d.inventory.getItemCount('coin') === 0, '道具被清空');
+
+// set 负数，应 clamp 到 0
+const setItem4 = rpg6d.executeEffects([{ type: 'item', itemId: 'coin', operation: 'set', value: -5 }]);
+assert(setItem4.totalSuccess === 1, '道具 set 负数 → clamp 成 0');
+assert(rpg6d.inventory.getItemCount('coin') === 0, '道具仍为 0');
+
+// set NaN / Infinity 应该失败
+const setBad = rpg6d.executeEffects([
+  { type: 'gold', operation: 'set', value: NaN },
+  { type: 'gold', operation: 'set', value: Infinity },
+]);
+assert(setBad.totalSuccess === 0, 'NaN/Infinity → 失败');
+assert(rpg6d.getGold() === 777, '金币不变，仍 777');
+
+console.log('\n第六部分完成');
+
+// ============================================================
 section('测试总结');
 // ============================================================
 console.log('\n========================================');

@@ -91,7 +91,7 @@ export interface QuestPhase {
   name?: string;
   description?: string;
   objectives: Omit<QuestObjective, 'currentCount'>[];
-  rewards?: QuestReward[];
+  rewards?: (QuestReward | DialogueEffect)[];
 }
 
 export interface QuestReward {
@@ -110,7 +110,7 @@ export interface QuestConfig {
   name: string;
   description?: string;
   objectives: Omit<QuestObjective, 'currentCount'>[];
-  rewards?: QuestReward[];
+  rewards?: (QuestReward | DialogueEffect)[];
   prerequisites?: string[];
   isMain?: boolean;
   chapterId?: string;
@@ -148,12 +148,13 @@ export interface DialogueEffect {
   characterId?: string;
   itemId?: string;
   questId?: string;
+  objectiveId?: string;
   variableKey?: string;
   chapterId?: string;
   skillId?: string;
   value?: number | string | boolean;
   operation?: 'add' | 'set' | 'remove';
-  questAction?: 'start' | 'complete' | 'update' | 'reset';
+  questAction?: 'start' | 'complete' | 'update' | 'reset' | 'progress';
 }
 
 export interface EffectResult {
@@ -167,6 +168,26 @@ export interface EffectResult {
 
 export interface EffectsExecutionResult {
   results: EffectResult[];
+  totalSuccess: number;
+  totalFailed: number;
+  allSuccess: boolean;
+}
+
+export interface QuestRewardResult {
+  reward: QuestReward;
+  success: boolean;
+  message?: string;
+  error?: string;
+  oldValue?: any;
+  newValue?: any;
+}
+
+export interface QuestRewardsExecutionResult {
+  rewards: {
+    success: QuestRewardResult[];
+    failed: QuestRewardResult[];
+  };
+  effects?: EffectsExecutionResult;
   totalSuccess: number;
   totalFailed: number;
   allSuccess: boolean;
@@ -312,6 +333,7 @@ export interface BattleLogEntry {
   missed?: boolean;
   skillId?: string;
   itemId?: string;
+  success?: boolean;
 }
 
 export interface SaveData {

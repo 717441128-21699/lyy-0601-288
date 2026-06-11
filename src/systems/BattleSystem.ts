@@ -21,6 +21,7 @@ export interface BattleContext {
   getCharacterSpeed?: (characterId: string) => number;
   getCharacterSkills?: (characterId: string) => string[];
   getCharacterLevel?: (characterId: string) => number;
+  getPlayerCharacterId?: () => string | undefined;
   getSkillConfig?: (skillId: string) => SkillConfig | undefined;
   addExp: (characterId: string, exp: number) => { leveledUp: boolean; levelsGained: number };
   addGold?: (amount: number) => number;
@@ -43,6 +44,7 @@ export class BattleSystem extends EventEmitter {
   private currentBattle: BattleState | null = null;
   private context?: BattleContext;
   private retryCount: Map<string, number> = new Map();
+  private enemyTurnTimeout?: any;
 
   constructor(configs: BattleConfig[] = [], skillConfigs: SkillConfig[] = []) {
     super();
@@ -109,7 +111,13 @@ export class BattleSystem extends EventEmitter {
 
     const characters: BattleCharacter[] = [];
 
-    config.playerCharacters.forEach((charId) => {
+    const playerChars = config.playerCharacters?.length
+      ? config.playerCharacters
+      : this.context?.getPlayerCharacterId?.()
+        ? [this.context.getPlayerCharacterId()!]
+        : [];
+
+    playerChars.forEach((charId) => {
       const maxHp = this.sanitizeAmount(this.context!.getCharacterMaxHp(charId), 1);
       const rawMaxMp = this.context!.getCharacterMaxMp(charId);
       const maxMp = this.isValidNumber(rawMaxMp) ? this.sanitizeAmount(rawMaxMp, 0) : undefined;
@@ -193,16 +201,36 @@ export class BattleSystem extends EventEmitter {
   }
 
   private getCharacterSpeed(char: BattleCharacter): number {
+    let base = 10;
     if (char.isPlayerSide && this.context) {
       const fromCtx = this.context.getCharacterSpeed?.(char.characterId);
-      if (this.isValidNumber(fromCtx)) return this.sanitizeAmount(fromCtx, 0);
-      const fromAttr = this.context.getCharacterAttribute(char.characterId, 'speed');
-      if (this.isValidNumber(fromAttr)) return this.sanitizeAmount(fromAttr, 0);
+      if (this.isValidNumber(fromCtx)) base = this.sanitizeAmount(fromCtx, 0);
+      else {
+        const fromAttr = this.context.getCharacterAttribute(char.characterId, 'speed');
+        if (this.isValidNumber(fromAttr)) base = this.sanitizeAmount(fromAttr, 0);
+      }
+    } else {
+      const enemyConfig = this.getEnemyConfig(char.characterId);
+      const fromEnemy = enemyConfig?.attributes.speed;
+      if (this.isValidNumber(fromEnemy)) base = this.sanitizeAmount(fromEnemy, 0);
     }
-    const enemyConfig = this.getEnemyConfig(char.characterId);
-    const fromEnemy = enemyConfig?.attributes.speed;
-    if (this.isValidNumber(fromEnemy)) return this.sanitizeAmount(fromEnemy, 0);
-    return 10;
+    const mod = this.getBuffAttributeModifier(char, 'speed');
+    return this.sanitizeAmount(base + mod, 0);
+  }
+
+  private getBuffAttributeModifier(char: BattleCharacter, attributeId: string): number {
+    let modifier = 0;
+    for (const buff of char.buffs) {
+      if (buff.attributeId === attributeId) {
+        modifier += buff.value;
+      }
+    }
+    for (const debuff of char.debuffs) {
+      if (debuff.attributeId === attributeId) {
+        modifier -= debuff.value;
+      }
+    }
+    return modifier;
   }
 
   private buildTurnQueue(characters: BattleCharacter[]): string[] {
@@ -264,7 +292,7 @@ export class BattleSystem extends EventEmitter {
       });
 
       if (!actor.isPlayerSide) {
-        setTimeout(() => this.executeEnemyTurn(), 500);
+        this.enemyTurnTimeout = setTimeout(() => this.executeEnemyTurn(), 500);
       }
       return;
     }
@@ -295,7 +323,42 @@ export class BattleSystem extends EventEmitter {
         if (buff.attributeId && this.isValidNumber(buff.value)) {
           this.applyBuffAttributeEffect(char, buff);
         }
+      });
+    });
+  }
 
+  private applyBuffAttributeEffect(char: BattleCharacter, buff: Buff): void {
+    if (!buff.attributeId || !this.isValidNumber(buff.value)) return;
+
+    const operation = this.detectBuffOperation(buff);
+
+    if (buff.attributeId === 'hp' || buff.attributeId === 'maxHp') {
+      return;
+    }
+    if (buff.attributeId === 'mp' || buff.attributeId === 'maxMp') {
+      return;
+    }
+  }
+
+  private detectBuffOperation(buff: Buff): string {
+    const id = buff.id.toLowerCase();
+    if (id.includes('mul') || id.includes('percent') || id.includes('%')) {
+      return BUFF_OPERATION_MUL;
+    }
+    if (id.includes('div')) {
+      return BUFF_OPERATION_DIV;
+    }
+    return BUFF_OPERATION_ADD;
+  }
+
+  private processTurnEndStatusEffects(): void {
+    if (!this.currentBattle) return;
+
+    this.currentBattle.characters.forEach((char) => {
+      if (char.currentHp <= 0) return;
+
+      const allEffects = [...char.buffs, ...char.debuffs];
+      allEffects.forEach((buff) => {
         if (this.isValidNumber(buff.tickDamage) && buff.tickDamage !== 0) {
           const tick = this.sanitizeAmount(Math.abs(buff.tickDamage!));
           if (buff.type === 'debuff') {
@@ -352,34 +415,6 @@ export class BattleSystem extends EventEmitter {
         }
       });
     });
-  }
-
-  private applyBuffAttributeEffect(char: BattleCharacter, buff: Buff): void {
-    if (!buff.attributeId || !this.isValidNumber(buff.value)) return;
-
-    const operation = this.detectBuffOperation(buff);
-
-    if (buff.attributeId === 'hp' || buff.attributeId === 'maxHp') {
-      return;
-    }
-    if (buff.attributeId === 'mp' || buff.attributeId === 'maxMp') {
-      return;
-    }
-  }
-
-  private detectBuffOperation(buff: Buff): string {
-    const id = buff.id.toLowerCase();
-    if (id.includes('mul') || id.includes('percent') || id.includes('%')) {
-      return BUFF_OPERATION_MUL;
-    }
-    if (id.includes('div')) {
-      return BUFF_OPERATION_DIV;
-    }
-    return BUFF_OPERATION_ADD;
-  }
-
-  private processTurnEndStatusEffects(): void {
-    return;
   }
 
   private processCooldownsAndBuffDurations(): void {
@@ -498,6 +533,54 @@ export class BattleSystem extends EventEmitter {
     return logEntry;
   }
 
+  executeEnemyAction(action: BattleAction): BattleLogEntry | null {
+    if (!this.currentBattle) return null;
+
+    const validPhases: string[] = ['enemyTurn'];
+    if (!validPhases.includes(this.currentBattle.phase)) {
+      return null;
+    }
+
+    const actor = this.getCurrentActor();
+    if (!actor || actor.isPlayerSide || actor.currentHp <= 0) return null;
+
+    if (this.enemyTurnTimeout) {
+      clearTimeout(this.enemyTurnTimeout);
+      this.enemyTurnTimeout = undefined;
+    }
+
+    let logEntry: BattleLogEntry | null = null;
+
+    switch (action.type) {
+      case 'attack':
+        logEntry = this.performAttack(actor, action.targetId);
+        break;
+      case 'skill':
+        if (action.skillId) {
+          logEntry = this.performSkill(actor, action.skillId, action.targetId);
+        }
+        break;
+      case 'defend':
+        logEntry = this.performDefend(actor);
+        break;
+    }
+
+    if (logEntry) {
+      this.pushLog(logEntry);
+      this.emit('battleEnemyAction', {
+        battleId: this.currentBattle!.id,
+        logEntry,
+      });
+    }
+
+    if (this.checkBattleEnd()) return logEntry;
+
+    this.currentBattle!.turnQueueIndex++;
+    this.advanceToNextActor();
+
+    return logEntry;
+  }
+
   private pushLog(entry: BattleLogEntry): void {
     if (!this.currentBattle) return;
     this.currentBattle.actionLog.push(entry);
@@ -605,7 +688,7 @@ export class BattleSystem extends EventEmitter {
   private performFlee(actor: BattleCharacter): BattleLogEntry | null {
     const config = this.battleConfigs.get(this.currentBattle!.id);
     if (!config?.allowFlee) {
-      return this.createLogEntry(actor.characterId, 'flee', undefined, 0, '无法逃跑');
+      return this.createLogEntry(actor.characterId, 'flee', undefined, 0, '无法逃跑', undefined, undefined, undefined, undefined, undefined, false);
     }
 
     const success = Math.random() > 0.3;
@@ -614,7 +697,7 @@ export class BattleSystem extends EventEmitter {
       return this.createLogEntry(actor.characterId, 'flee', undefined, 0, '成功逃跑');
     }
 
-    return this.createLogEntry(actor.characterId, 'flee', undefined, 0, '逃跑失败');
+    return this.createLogEntry(actor.characterId, 'flee', undefined, 0, '逃跑失败', undefined, undefined, undefined, undefined, undefined, false);
   }
 
   private performSkill(
@@ -641,7 +724,8 @@ export class BattleSystem extends EventEmitter {
         undefined,
         undefined,
         undefined,
-        skillId
+        skillId,
+        false
       );
     }
 
@@ -871,7 +955,7 @@ export class BattleSystem extends EventEmitter {
     if (this.checkBattleEnd()) return;
 
     this.currentBattle!.turnQueueIndex++;
-    setTimeout(() => this.advanceToNextActor(), 400);
+    this.enemyTurnTimeout = setTimeout(() => this.advanceToNextActor(), 400);
   }
 
   private decideEnemyAction(actor: BattleCharacter): BattleAction {
@@ -941,23 +1025,31 @@ export class BattleSystem extends EventEmitter {
   }
 
   private getCharacterAttackPower(char: BattleCharacter): number {
+    let base = 10;
     if (char.isPlayerSide && this.context) {
       const val = this.context.getCharacterAttribute(char.characterId, 'attack');
-      return this.isValidNumber(val) ? this.sanitizeAmount(val, 0) : 10;
+      if (this.isValidNumber(val)) base = this.sanitizeAmount(val, 0);
+    } else {
+      const enemyConfig = this.getEnemyConfig(char.characterId);
+      const val = enemyConfig?.attributes.attack;
+      if (this.isValidNumber(val)) base = this.sanitizeAmount(val, 0);
     }
-    const enemyConfig = this.getEnemyConfig(char.characterId);
-    const val = enemyConfig?.attributes.attack;
-    return this.isValidNumber(val) ? this.sanitizeAmount(val, 0) : 10;
+    const mod = this.getBuffAttributeModifier(char, 'attack');
+    return this.sanitizeAmount(base + mod, 0);
   }
 
   private getCharacterDefensePower(char: BattleCharacter): number {
+    let base = 5;
     if (char.isPlayerSide && this.context) {
       const val = this.context.getCharacterAttribute(char.characterId, 'defense');
-      return this.isValidNumber(val) ? this.sanitizeAmount(val, 0) : 5;
+      if (this.isValidNumber(val)) base = this.sanitizeAmount(val, 0);
+    } else {
+      const enemyConfig = this.getEnemyConfig(char.characterId);
+      const val = enemyConfig?.attributes.defense;
+      if (this.isValidNumber(val)) base = this.sanitizeAmount(val, 0);
     }
-    const enemyConfig = this.getEnemyConfig(char.characterId);
-    const val = enemyConfig?.attributes.defense;
-    return this.isValidNumber(val) ? this.sanitizeAmount(val, 0) : 5;
+    const mod = this.getBuffAttributeModifier(char, 'defense');
+    return this.sanitizeAmount(base + mod, 0);
   }
 
   private getEnemyConfig(enemyId: string, battleId?: string): EnemyConfig | undefined {
@@ -977,7 +1069,8 @@ export class BattleSystem extends EventEmitter {
     critical?: boolean,
     missed?: boolean,
     itemId?: string,
-    skillId?: string
+    skillId?: string,
+    success?: boolean
   ): BattleLogEntry {
     const safeDamage = damage !== undefined ? this.sanitizeAmount(damage, 0) : undefined;
     const safeHeal = heal !== undefined ? this.sanitizeAmount(heal, 0) : undefined;
@@ -995,6 +1088,7 @@ export class BattleSystem extends EventEmitter {
       missed,
       skillId,
       itemId,
+      success: success !== false,
     };
   }
 

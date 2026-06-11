@@ -5,16 +5,16 @@ import {
   QuestReward,
   QuestRepeatType,
   QuestPhase,
+  DialogueEffect,
+  QuestRewardsExecutionResult,
 } from '../types';
 import { EventEmitter } from './EventEmitter';
 
 export interface QuestRewardHandler {
-  claimRewards: (characterId: string, rewards: QuestReward[]) => {
-    exp: number;
-    gold: number;
-    items: { itemId: string; quantity: number }[];
-    attributes: { id: string; value: number }[];
-  };
+  claimRewards: (
+    characterId: string,
+    rewards: (QuestReward | DialogueEffect)[]
+  ) => QuestRewardsExecutionResult;
   getPlayerCharacterId: () => string | undefined;
 }
 
@@ -356,6 +356,51 @@ export class QuestSystem extends EventEmitter {
     this.updateObjectiveByType('custom', customId, count);
   }
 
+  reportProgress(
+    questId: string,
+    objectiveId: string,
+    amount: number
+  ): { success: boolean; newCount: number; completed: boolean } {
+    const quest = this.getQuest(questId);
+    const config = this.getQuestConfig(questId);
+    if (!quest || !config || quest.status !== 'active') {
+      return { success: false, newCount: 0, completed: false };
+    }
+
+    const objectives = quest.phaseObjectives ?? quest.objectives;
+    const obj = objectives.find((o) => o.id === objectiveId);
+    if (!obj) return { success: false, newCount: 0, completed: false };
+
+    const safeAmount = this.sanitizeCount(amount, 1);
+    const oldCount = obj.currentCount;
+    obj.currentCount = Math.min(obj.targetCount, oldCount + safeAmount);
+    const justCompleted = oldCount < obj.targetCount && obj.currentCount >= obj.targetCount;
+
+    if (justCompleted) {
+      this.emit('questObjectiveComplete', {
+        questId,
+        objectiveId,
+        objective: obj,
+        isPhaseObjective: !!quest.phaseObjectives,
+      });
+    }
+
+    if (oldCount !== obj.currentCount) {
+      this.emit('questUpdated', {
+        questId,
+        quest,
+        objectiveId,
+        change: obj.currentCount - oldCount,
+      });
+    }
+
+    return {
+      success: true,
+      newCount: obj.currentCount,
+      completed: obj.currentCount >= obj.targetCount,
+    };
+  }
+
   private isCurrentPhaseComplete(questId: string): boolean {
     const quest = this.getQuest(questId);
     if (!quest?.phaseObjectives) return false;
@@ -422,7 +467,7 @@ export class QuestSystem extends EventEmitter {
     return mainObjectivesComplete && phasesComplete;
   }
 
-  completeQuest(questId: string): QuestReward[] | null {
+  completeQuest(questId: string): QuestRewardsExecutionResult | null {
     const quest = this.getQuest(questId);
     const config = this.getQuestConfig(questId);
     if (!quest || !config || quest.status === 'completed') return null;
@@ -431,16 +476,17 @@ export class QuestSystem extends EventEmitter {
     quest.completedAt = Date.now();
 
     const rewards = config.rewards || [];
+    let result: QuestRewardsExecutionResult | null = null;
 
     if (rewards.length && this.rewardHandler && !quest.claimedRewards) {
       const playerId = this.rewardHandler.getPlayerCharacterId();
       if (playerId) {
-        const claimed = this.rewardHandler.claimRewards(playerId, rewards);
+        result = this.rewardHandler.claimRewards(playerId, rewards);
         quest.claimedRewards = true;
         this.emit('questRewardsClaimed', {
           questId,
           quest,
-          rewards: claimed,
+          rewards: result,
           rawRewards: rewards,
         });
       }
@@ -454,10 +500,10 @@ export class QuestSystem extends EventEmitter {
 
     this.checkAvailableQuests();
 
-    return rewards;
+    return result;
   }
 
-  claimQuestRewards(questId: string): QuestReward[] | null {
+  claimQuestRewards(questId: string): QuestRewardsExecutionResult | null {
     const quest = this.getQuest(questId);
     const config = this.getQuestConfig(questId);
     if (!quest || !config || quest.status !== 'completed' || quest.claimedRewards) {
@@ -465,21 +511,23 @@ export class QuestSystem extends EventEmitter {
     }
 
     const rewards = config.rewards || [];
+    let result: QuestRewardsExecutionResult | null = null;
 
     if (this.rewardHandler) {
       const playerId = this.rewardHandler.getPlayerCharacterId();
       if (playerId) {
-        this.rewardHandler.claimRewards(playerId, rewards);
+        result = this.rewardHandler.claimRewards(playerId, rewards);
         quest.claimedRewards = true;
         this.emit('questRewardsClaimed', {
           questId,
           quest,
           rewards,
+          result,
         });
       }
     }
 
-    return rewards;
+    return result;
   }
 
   failQuest(questId: string): boolean {
@@ -556,7 +604,7 @@ export class QuestSystem extends EventEmitter {
     });
   }
 
-  getQuestRewards(questId: string): QuestReward[] {
+  getQuestRewards(questId: string): (QuestReward | DialogueEffect)[] {
     const config = this.getQuestConfig(questId);
     return config?.rewards || [];
   }

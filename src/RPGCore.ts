@@ -25,6 +25,8 @@ import {
   LevelConfig,
   SkillConfig,
   EffectsExecutionResult,
+  QuestRewardsExecutionResult,
+  QuestRewardResult,
   SaveStorageAdapter,
   SaveMigration,
 } from './types';
@@ -159,15 +161,18 @@ export class RPGCore extends EventEmitter {
       hasItem: (iid, q) => self.inventory.hasItem(iid, q),
       addItem: (iid, q) => self.inventory.addItem(iid, q),
       removeItem: (iid, q) => self.inventory.removeItem(iid, q),
+      setItemCount: (iid, q) => self.inventory.setItemCount(iid, q),
       startQuest: (qid) => self.quest.startQuest(qid),
       completeQuest: (qid) => self.quest.completeQuest(qid),
       updateQuestObjective: (qid, oid, n) => self.quest.updateObjective(qid, oid, n),
+      reportQuestProgress: (qid, oid, n) => self.quest.reportProgress(qid, oid, n),
       resetQuest: (qid) => self.quest.resetQuest(qid),
       getVariable: (k) => self.dialogue.getVariable(k),
       setVariable: (k, v) => self.dialogue.setVariable(k, v),
       unlockChapter: (cid) => self.save.unlockChapter(cid),
       setCurrentChapter: (cid) => self.save.setCurrentChapter(cid),
       addGold: (n) => self.inventory.addGold(n),
+      setGold: (n) => self.inventory.setGold(n),
       spendGold: (n) => self.inventory.spendGold(n),
       addExp: (cid, n) => self.character.addExp(cid, n),
       addSkill: (cid, sid) => self.character.addSkill(cid, sid),
@@ -204,6 +209,7 @@ export class RPGCore extends EventEmitter {
       getCharacterSpeed: (charId) => this.character.getAttribute(charId, 'speed') || 10,
       getCharacterSkills: (charId) => this.character.getCharacter(charId)?.skills || [],
       getCharacterLevel: (charId) => this.character.getLevel(charId),
+      getPlayerCharacterId: () => this.character.getPlayerCharacter()?.id,
       getSkillConfig: (skillId) => this.battle.getSkillConfig(skillId),
       addExp: (charId, exp) => this.character.addExp(charId, exp),
       addGold: (amount) => this.inventory.addGold(amount),
@@ -370,28 +376,11 @@ export class RPGCore extends EventEmitter {
   public applyQuestRewards(
     characterId: string,
     rewards: (QuestReward | DialogueEffect)[]
-  ): {
-    exp: number;
-    gold: number;
-    items: { itemId: string; quantity: number }[];
-    attributes: { id: string; value: number }[];
-    affinity: { characterId: string; value: number }[];
-    effects?: any;
-  } {
-    const summary: {
-      exp: number;
-      gold: number;
-      items: { itemId: string; quantity: number }[];
-      attributes: { id: string; value: number }[];
-      affinity: { characterId: string; value: number }[];
-      effects?: any;
-    } = {
-      exp: 0,
-      gold: 0,
-      items: [] as { itemId: string; quantity: number }[],
-      attributes: [] as { id: string; value: number }[],
-      affinity: [] as { characterId: string; value: number }[],
-    };
+  ): QuestRewardsExecutionResult {
+    const rewardSuccessList: QuestRewardResult[] = [];
+    const rewardFailedList: QuestRewardResult[] = [];
+    let totalSuccess = 0;
+    let totalFailed = 0;
 
     const questRewardTypes = new Set(['exp', 'item', 'gold', 'attribute', 'affinity']);
     const pureRewards: QuestReward[] = [];
@@ -399,64 +388,142 @@ export class RPGCore extends EventEmitter {
 
     (rewards as any[]).forEach((r) => {
       if (questRewardTypes.has(r.type)) {
-        pureRewards.push(r);
+        if (r.operation) {
+          pureEffects.push(r);
+        } else {
+          pureRewards.push(r);
+        }
       } else {
         pureEffects.push(r);
       }
     });
 
     pureRewards.forEach((reward) => {
-      if (
-        typeof reward.value !== 'number' ||
-        isNaN(reward.value) ||
-        !isFinite(reward.value)
-      )
+      const isValidNum = (v: any): boolean =>
+        typeof v === 'number' && !isNaN(v) && isFinite(v);
+
+      const needsValueCheck = reward.type !== 'item';
+      if (needsValueCheck && !isValidNum(reward.value)) {
+        rewardFailedList.push({
+          reward,
+          success: false,
+          error: `${reward.type}.value 不是有效数值`,
+        });
+        totalFailed++;
         return;
+      }
 
-      const safeValue = Math.max(0, reward.value);
+      const safeValue = isValidNum(reward.value) ? Math.max(0, reward.value) : 0;
+      let success = false;
+      let message: string | undefined;
+      let oldValue: any;
+      let newValue: any;
 
-      switch (reward.type) {
-        case 'exp': {
-          this.character.addExp(characterId, safeValue);
-          summary.exp += safeValue;
-          break;
-        }
-        case 'item': {
-          if (reward.itemId) {
-            const qtyFromQuantity = typeof reward.quantity === 'number' ? reward.quantity : null;
-            const qtyFromValue = safeValue > 0 ? safeValue : null;
+      try {
+        switch (reward.type) {
+          case 'exp': {
+            oldValue = this.character.getExp(characterId);
+            const result = this.character.addExp(characterId, safeValue);
+            newValue = { gained: safeValue, ...result };
+            success = true;
+            message = `经验 +${safeValue}${result.leveledUp ? `，升级 ${result.levelsGained} 级` : ''}`;
+            break;
+          }
+          case 'item': {
+            if (!reward.itemId) {
+              rewardFailedList.push({
+                reward,
+                success: false,
+                error: '缺少 itemId',
+              });
+              totalFailed++;
+              return;
+            }
+            const qtyFromQuantity = isValidNum(reward.quantity) ? reward.quantity : null;
+            const qtyFromValue = isValidNum(reward.value) && reward.value > 0 ? reward.value : null;
             const qty = Math.max(1, qtyFromQuantity ?? qtyFromValue ?? 1);
-            const ok = this.inventory.addItem(reward.itemId, qty);
-            if (ok) summary.items.push({ itemId: reward.itemId, quantity: qty });
+            oldValue = this.inventory.getItemCount(reward.itemId);
+            success = this.inventory.addItem(reward.itemId, qty);
+            newValue = oldValue + (success ? qty : 0);
+            message = success ? `获得道具 ${reward.itemId} x${qty}` : `道具 ${reward.itemId} 添加失败`;
+            break;
           }
-          break;
-        }
-        case 'gold': {
-          this.inventory.addGold(safeValue);
-          summary.gold += safeValue;
-          break;
-        }
-        case 'attribute': {
-          if (reward.attributeId) {
-            this.character.addAttribute(characterId, reward.attributeId, safeValue);
-            summary.attributes.push({ id: reward.attributeId, value: safeValue });
+          case 'gold': {
+            oldValue = this.inventory.getGold();
+            newValue = this.inventory.addGold(safeValue);
+            success = true;
+            message = `金币 +${safeValue}`;
+            break;
           }
-          break;
+          case 'attribute': {
+            if (!reward.attributeId) {
+              rewardFailedList.push({
+                reward,
+                success: false,
+                error: '缺少 attributeId',
+              });
+              totalFailed++;
+              return;
+            }
+            oldValue = this.character.getAttribute(characterId, reward.attributeId);
+            newValue = this.character.addAttribute(characterId, reward.attributeId, safeValue);
+            success = true;
+            message = `属性 ${reward.attributeId} +${safeValue}`;
+            break;
+          }
+          case 'affinity': {
+            const cid = reward.characterId ?? characterId;
+            oldValue = this.character.getAffinity(cid);
+            newValue = this.character.addAffinity(cid, safeValue);
+            success = true;
+            message = `好感度 +${safeValue}`;
+            break;
+          }
+          default: {
+            rewardFailedList.push({
+              reward,
+              success: false,
+              error: `未知奖励类型: ${reward.type}`,
+            });
+            totalFailed++;
+            return;
+          }
         }
-        case 'affinity': {
-          const cid = reward.characterId ?? characterId;
-          this.character.addAffinity(cid, safeValue);
-          summary.affinity.push({ characterId: cid, value: safeValue });
-          break;
+
+        if (success) {
+          rewardSuccessList.push({ reward, success, message, oldValue, newValue });
+          totalSuccess++;
+        } else {
+          rewardFailedList.push({ reward, success: false, message, oldValue, newValue });
+          totalFailed++;
         }
+      } catch (e: any) {
+        rewardFailedList.push({
+          reward,
+          success: false,
+          error: e?.message || '奖励执行异常',
+        });
+        totalFailed++;
       }
     });
 
+    let effectsResult: EffectsExecutionResult | undefined;
     if (pureEffects.length) {
-      summary.effects = this.effect.execute(pureEffects, 'quest_reward');
+      effectsResult = this.effect.execute(pureEffects, 'quest_reward');
+      totalSuccess += effectsResult.totalSuccess;
+      totalFailed += effectsResult.totalFailed;
     }
 
-    return summary;
+    return {
+      rewards: {
+        success: rewardSuccessList,
+        failed: rewardFailedList,
+      },
+      effects: effectsResult,
+      totalSuccess,
+      totalFailed,
+      allSuccess: totalFailed === 0,
+    };
   }
 
   public createPlayer(config: Omit<CharacterConfig, 'isPlayer'>): CharacterData {
@@ -473,12 +540,11 @@ export class RPGCore extends EventEmitter {
     return ok;
   }
 
-  public completeQuest(questId: string): boolean {
-    const rewards = this.quest.completeQuest(questId);
-    return rewards !== null;
+  public completeQuest(questId: string): QuestRewardsExecutionResult | null {
+    return this.quest.completeQuest(questId);
   }
 
-  public claimQuestRewards(questId: string): QuestReward[] | null {
+  public claimQuestRewards(questId: string): QuestRewardsExecutionResult | null {
     return this.quest.claimQuestRewards(questId);
   }
 

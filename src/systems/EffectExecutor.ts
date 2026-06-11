@@ -2,6 +2,7 @@ import {
   DialogueEffect,
   EffectResult,
   EffectsExecutionResult,
+  QuestRewardsExecutionResult,
 } from '../types';
 import { EventEmitter } from './EventEmitter';
 
@@ -15,15 +16,22 @@ export interface EffectContext {
   hasItem: (itemId: string, quantity?: number) => boolean;
   addItem: (itemId: string, quantity: number) => boolean;
   removeItem: (itemId: string, quantity: number) => boolean;
+  setItemCount: (itemId: string, quantity: number) => boolean;
   startQuest: (questId: string) => boolean;
-  completeQuest: (questId: string) => any[] | null;
+  completeQuest: (questId: string) => QuestRewardsExecutionResult | null;
   updateQuestObjective: (questId: string, objectiveId: string, count: number) => boolean;
+  reportQuestProgress: (
+    questId: string,
+    objectiveId: string,
+    amount: number
+  ) => { success: boolean; newCount: number; completed: boolean };
   resetQuest: (questId: string) => boolean;
   getVariable: (key: string) => any;
   setVariable: (key: string, value: any) => void;
   unlockChapter: (chapterId: string) => boolean;
   setCurrentChapter: (chapterId: string) => boolean;
   addGold: (amount: number) => number;
+  setGold: (amount: number) => number;
   spendGold: (amount: number) => boolean;
   addExp: (characterId: string, exp: number) => { leveledUp: boolean; levelsGained: number };
   addSkill: (characterId: string, skillId: string) => boolean;
@@ -89,6 +97,7 @@ export class EffectExecutor extends EventEmitter {
       characterId,
       itemId,
       questId,
+      objectiveId,
       variableKey,
       chapterId,
       skillId,
@@ -154,20 +163,21 @@ export class EffectExecutor extends EventEmitter {
             break;
           }
           const itemValue = value as number;
-          const safeQuantity = this.context.clampValue(
-            itemValue * (operation === 'remove' ? -1 : 1),
-            -9999,
-            9999
-          );
 
-          if (operation === 'add' || operation === 'set') {
-            const qty = Math.abs(safeQuantity);
+          if (operation === 'add') {
+            const qty = this.context.clampValue(Math.abs(itemValue), 0, 9999);
             oldValue = 0;
             success = this.context.addItem(itemId, qty);
             newValue = qty;
             message = success ? `获得道具 ${itemId} x${qty}` : `道具 ${itemId} 添加失败`;
+          } else if (operation === 'set') {
+            const qty = this.context.clampValue(itemValue, 0, 9999);
+            oldValue = 0;
+            success = this.context.setItemCount(itemId, qty);
+            newValue = qty;
+            message = success ? `道具 ${itemId} 数量设为 ${qty}` : `道具 ${itemId} 设置失败`;
           } else if (operation === 'remove') {
-            const qty = Math.abs(safeQuantity);
+            const qty = this.context.clampValue(Math.abs(itemValue), 0, 9999);
             oldValue = qty;
             success = this.context.removeItem(itemId, qty);
             newValue = 0;
@@ -190,6 +200,19 @@ export class EffectExecutor extends EventEmitter {
             success = rewards !== null;
             message = success ? `任务 ${questId} 已完成` : `任务 ${questId} 无法完成`;
             newValue = rewards;
+          } else if (questAction === 'progress') {
+            if (!objectiveId || !this.context.isValidNumber(value) || (value as number) < 1) {
+              error = '任务进度推进缺少 objectiveId 或有效 value（必须 ≥ 1）';
+              success = false;
+              break;
+            }
+            const amount = this.context.clampValue(value as number, 1);
+            const progressResult = this.context.reportQuestProgress(questId, objectiveId, amount);
+            success = progressResult.success;
+            newValue = progressResult;
+            message = success
+              ? `任务 ${questId} 目标 ${objectiveId} 推进 ${amount}，当前 ${progressResult.newCount}${progressResult.completed ? '（已完成）' : ''}`
+              : `任务 ${questId} 目标 ${objectiveId} 推进失败`;
           } else if (questAction === 'update') {
             success = true;
             message = `任务 ${questId} 目标已更新`;
@@ -246,12 +269,18 @@ export class EffectExecutor extends EventEmitter {
           }
           const goldValue = value as number;
 
-          if (operation === 'add' || operation === 'set') {
+          if (operation === 'add') {
             const safeAmount = this.context.clampValue(goldValue, 0);
             newValue = this.context.addGold(safeAmount);
             oldValue = newValue - safeAmount;
             success = true;
             message = `获得金币 ${safeAmount}`;
+          } else if (operation === 'set') {
+            const safeAmount = this.context.clampValue(goldValue, 0);
+            oldValue = 0;
+            newValue = this.context.setGold(safeAmount);
+            success = true;
+            message = `金币设为 ${safeAmount}`;
           } else if (operation === 'remove') {
             const safeAmount = this.context.clampValue(goldValue, 0);
             oldValue = 0;
